@@ -1,0 +1,30 @@
+[
+  {
+    "domain": ".grok.com",
+    "name": "sso",
+    "value": "paste-your-cookie-value-here",
+    "path": "/",
+    "secure": true
+  },
+  {
+    "domain": ".grok.com",
+    "name": "sso-rw",
+    "value": "paste-your-cookie-value-here",
+    "path": "/",
+    "secure": true
+  },
+  {
+    "domain": ".grok.com",
+    "name": "grok_device_id",
+    "value": "paste-your-cookie-value-here",
+    "path": "/",
+    "secure": true
+  },
+  {
+    "domain": ".grok.com",
+    "name": "cf_clearance",
+    "value": "paste-your-cookie-value-here",
+    "path": "/",
+    "secure": true
+  }
+]
