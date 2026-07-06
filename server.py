@@ -23,6 +23,14 @@ ASSETS_BASE = "https://assets.grok.com"
 IMAGINE_PUBLIC_BASE = "https://imagine-public.x.ai/imagine-public"
 COOKIE_FILE = Path(__file__).with_name("cookies.json")
 COOKIES_DIR = Path(__file__).with_name("cookies")
+_ENV_PATH = Path(__file__).with_name(".env")
+if _ENV_PATH.exists():
+    for _line in _ENV_PATH.read_text(encoding="utf-8").splitlines():
+        _line = _line.strip()
+        if not _line or _line.startswith("#") or "=" not in _line:
+            continue
+        _k, _v = _line.split("=", 1)
+        os.environ.setdefault(_k.strip(), _v.strip())
 BROWSER_STATE: dict[str, Any] = {"port": None, "ws_url": None}
 
 
@@ -292,6 +300,11 @@ async def grok_request(
         return resp.json()
 
 
+async def grok_call(path: str, cookies: dict[str, str], payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Call any Grok REST endpoint through the browser fetch layer (bypasses anti-bot)."""
+    return await browser_fetch(path, cookies, payload or {}, stream=False)
+
+
 async def grok_stream_request(path: str, cookies: dict[str, str], payload: dict[str, Any], video: bool = False) -> list[dict[str, Any]]:
     try:
         return await browser_fetch(path, cookies, payload, stream=True)
@@ -552,6 +565,184 @@ async def create_and_wait_media(
     return {"status": "timeout", **summary, **urls}
 
 
+OUTPUT_DIR = Path(__file__).with_name("output")
+
+
+async def download_asset(cookies: dict[str, str], url: str, dest: Path, chunk: int = 65536) -> Path:
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    headers = build_headers(cookies, referer="https://grok.com/imagine")
+    async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
+        async with client.stream("GET", url, headers=headers) as resp:
+            resp.raise_for_status()
+            with dest.open("wb") as fh:
+                async for part in resp.aiter_bytes(chunk):
+                    fh.write(part)
+    return dest
+
+
+def guess_extension(url: str, default: str) -> str:
+    for suffix in (".mp4", ".webm", ".png", ".jpg", ".jpeg", ".webp", ".gif"):
+        if suffix in url.lower():
+            return suffix
+    return default
+
+
+async def download_media_assets(cookies: dict[str, str], post_id: str, urls: list[str], kind: str) -> list[Path]:
+    saved: list[Path] = []
+    for i, url in enumerate(urls):
+        suffix = guess_extension(url, ".mp4" if kind == "video" else ".jpg")
+        dest = OUTPUT_DIR / f"{post_id}_{kind}_{i}{suffix}"
+        saved.append(await download_asset(cookies, url, dest))
+    return saved
+
+
+TELEGRAM_ENV_TOKEN = "GROK_TG_BOT_TOKEN"
+TELEGRAM_ENV_CHAT = "GROK_TG_CHAT_ID"
+
+
+def resolve_telegram(arguments: dict[str, Any]) -> tuple[str, str]:
+    token = arguments.get("telegram_bot_token") or os.environ.get(TELEGRAM_ENV_TOKEN)
+    chat_id = arguments.get("telegram_chat_id") or os.environ.get(TELEGRAM_ENV_CHAT)
+    if not token or not chat_id:
+        raise ValueError(f"Telegram not configured. Set env {TELEGRAM_ENV_TOKEN}/{TELEGRAM_ENV_CHAT} or pass telegram_bot_token/telegram_chat_id")
+    return token, str(chat_id)
+
+
+async def telegram_send_media(token: str, chat_id: str, file_path: Path, caption: str | None, media_kind: str) -> dict[str, Any]:
+    endpoint = {
+        "video": ("sendVideo", "video"),
+        "photo": ("sendPhoto", "photo"),
+        "document": ("sendDocument", "document"),
+    }[media_kind]
+    method, field = endpoint
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    async with httpx.AsyncClient(timeout=None) as client:
+        with file_path.open("rb") as fh:
+            files = {field: (file_path.name, fh, "video/mp4" if media_kind == "video" else "application/octet-stream")}
+            data: dict[str, str] = {"chat_id": chat_id}
+            if caption:
+                data["caption"] = caption[:1024]
+            resp = await client.post(url, data=data, files=files)
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def send_generation_to_telegram(
+    cookies: dict[str, str],
+    result: dict[str, Any],
+    kind: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    token, chat_id = resolve_telegram(arguments)
+    urls_key = "video_urls" if kind == "video" else "image_urls"
+    urls = result.get(urls_key) or []
+    if not urls:
+        raise ValueError(f"No {urls_key} to send")
+    post_id = result.get("post_id") or result.get("video_post_id") or "grok"
+    files = await download_media_assets(cookies, post_id, urls, kind)
+    caption = arguments.get("telegram_caption") or arguments.get("prompt")
+    telegram_kind = "video" if kind == "video" else "photo"
+    sent = []
+    for path in files:
+        info = await telegram_send_media(token, chat_id, path, caption, telegram_kind)
+        sent.append({"file": str(path), "response": info})
+    return {"sent": sent}
+
+
+async def list_projects(cookies: dict[str, str]) -> dict[str, Any]:
+    return await grok_call("/rest/media/canvas/list", cookies, {})
+
+
+async def create_project(cookies: dict[str, str], name: str) -> dict[str, Any]:
+    return await grok_call("/rest/media/canvas/create", cookies, {"name": name})
+
+
+async def get_project_conversations(cookies: dict[str, str], project_id: str) -> dict[str, Any]:
+    return await grok_call("/rest/media/conversation/get", cookies, {"canvasId": project_id})
+
+
+async def create_project_node(cookies: dict[str, str], project_id: str, node: dict[str, Any]) -> dict[str, Any]:
+    payload = {"canvasId": project_id, **node}
+    return await grok_call("/rest/media/canvas/node/create", cookies, payload)
+
+
+async def set_project_thumbnail(cookies: dict[str, str], project_id: str, post_id: str) -> dict[str, Any]:
+    return await grok_call("/rest/media/canvas/set-thumbnail", cookies, {"canvasId": project_id, "postId": post_id})
+
+
+async def list_templates(cookies: dict[str, str]) -> dict[str, Any]:
+    return await grok_call("/rest/media/pipeline/template/list", cookies, {})
+
+
+async def get_template(cookies: dict[str, str], template_id: str) -> dict[str, Any]:
+    return await grok_call("/rest/media/pipeline/template/get", cookies, {"templateId": template_id})
+
+
+async def list_folders(cookies: dict[str, str]) -> dict[str, Any]:
+    return await grok_call("/rest/media/folder/list", cookies, {})
+
+
+async def get_post_folders(cookies: dict[str, str], post_id: str) -> dict[str, Any]:
+    return await grok_call("/rest/media/post/folders", cookies, {"postId": post_id})
+
+
+async def list_posts(cookies: dict[str, str], limit: int = 40, source: str = "MEDIA_POST_SOURCE_OWNED", safe: bool = False) -> dict[str, Any]:
+    # Grok removed the Mongo-backed listing; leave a legacy call for accounts where it still works.
+    return await grok_call(
+        "/rest/media/post/list",
+        cookies,
+        {"limit": limit, "filter": {"source": source, "safeForWork": safe}},
+    )
+
+
+async def list_project_posts(cookies: dict[str, str], project_id: str) -> dict[str, Any]:
+    return await grok_call("/rest/media/canvas/get", cookies, {"canvasId": project_id})
+
+
+async def like_post(cookies: dict[str, str], post_id: str) -> dict[str, Any]:
+    return await grok_call("/rest/media/post/like", cookies, {"id": post_id})
+
+
+async def delete_post(cookies: dict[str, str], post_id: str) -> dict[str, Any]:
+    return await grok_call("/rest/media/post/delete", cookies, {"id": post_id})
+
+
+async def search_status(cookies: dict[str, str]) -> dict[str, Any]:
+    return await grok_call("/rest/media/search/status", cookies, {})
+
+
+async def start_agent_conversation(cookies: dict[str, str], project_id: str | None, first_prompt: str, extra: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    payload: dict[str, Any] = {
+        "temporary": False,
+        "modeId": "imagine-agent-mode-dev",
+        "message": first_prompt,
+        "enableImageGeneration": True,
+        "enableImageStreaming": True,
+    }
+    if project_id:
+        payload["canvasId"] = project_id
+    if extra:
+        payload.update(extra)
+    return await browser_fetch("/rest/app-chat/conversations/new", cookies, payload, stream=True)
+
+
+async def send_agent_prompt(cookies: dict[str, str], conversation_id_value: str, message: str, extra: dict[str, Any] | None = None) -> Any:
+    payload: dict[str, Any] = {
+        "message": message,
+        "modeId": "imagine-agent-mode-dev",
+        "enableImageGeneration": True,
+        "enableImageStreaming": True,
+    }
+    if extra:
+        payload.update(extra)
+    return await browser_fetch(f"/rest/app-chat/conversations/{conversation_id_value}/responses", cookies, payload, stream=True)
+
+
+async def read_agent_conversation(cookies: dict[str, str], conversation_id_value: str) -> dict[str, Any]:
+    return await grok_call(f"/rest/app-chat/conversations/{conversation_id_value}/load-responses", cookies, {})
+
+
 async def create_share_link(cookies: dict[str, str], post_id: str) -> dict[str, Any]:
     return await grok_request(
         "POST",
@@ -789,6 +980,10 @@ async def list_tools() -> list[Tool]:
                     "count": {"type": "integer", "default": 2},
                     "mode": {"type": "string", "default": "fast", "description": "fast or expert"},
                     "enable_nsfw": {"type": "boolean"},
+                    "send_to_telegram": {"type": "boolean", "default": False},
+                    "telegram_bot_token": {"type": "string"},
+                    "telegram_chat_id": {"type": "string"},
+                    "telegram_caption": {"type": "string"},
                 },
                 "required": ["prompt"],
             },
@@ -807,6 +1002,10 @@ async def list_tools() -> list[Tool]:
                     "upscale_720p": {"type": "boolean", "default": False},
                     "share": {"type": "boolean", "default": False},
                     "timeout": {"type": "integer", "default": 300},
+                    "send_to_telegram": {"type": "boolean", "default": False},
+                    "telegram_bot_token": {"type": "string"},
+                    "telegram_chat_id": {"type": "string"},
+                    "telegram_caption": {"type": "string"},
                 },
                 "required": ["prompt"],
             },
@@ -870,6 +1069,191 @@ async def list_tools() -> list[Tool]:
             description="List Grok accounts available in cookies/<name>.json.",
             inputSchema={"type": "object", "properties": {}},
         ),
+        Tool(
+            name="send_to_telegram",
+            description="Download a Grok media post by post_id using account cookies and send it to Telegram as video/photo.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "post_id": {"type": "string"},
+                    "kind": {"type": "string", "enum": ["video", "image"], "default": "video"},
+                    "cookies": COOKIE_SCHEMA,
+                    "account": ACCOUNT_SCHEMA,
+                    "telegram_bot_token": {"type": "string", "description": f"Or set env {TELEGRAM_ENV_TOKEN}."},
+                    "telegram_chat_id": {"type": "string", "description": f"Or set env {TELEGRAM_ENV_CHAT}."},
+                    "telegram_caption": {"type": "string"},
+                },
+                "required": ["post_id"],
+            },
+        ),
+        Tool(
+            name="list_projects",
+            description="List Grok Imagine projects (canvases) for the account.",
+            inputSchema={"type": "object", "properties": {"cookies": COOKIE_SCHEMA, "account": ACCOUNT_SCHEMA}},
+        ),
+        Tool(
+            name="create_project",
+            description="Create a new Grok Imagine project (canvas).",
+            inputSchema={
+                "type": "object",
+                "properties": {"name": {"type": "string"}, "cookies": COOKIE_SCHEMA, "account": ACCOUNT_SCHEMA},
+                "required": ["name"],
+            },
+        ),
+        Tool(
+            name="get_project_conversations",
+            description="List agent conversations attached to a project.",
+            inputSchema={
+                "type": "object",
+                "properties": {"project_id": {"type": "string"}, "cookies": COOKIE_SCHEMA, "account": ACCOUNT_SCHEMA},
+                "required": ["project_id"],
+            },
+        ),
+        Tool(
+            name="create_project_node",
+            description="Attach a node (media post) to a project canvas.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_id": {"type": "string"},
+                    "node": {"type": "object", "description": "Node payload merged with canvasId, e.g. {\"postId\": ..., \"x\":0,\"y\":0}"},
+                    "cookies": COOKIE_SCHEMA,
+                    "account": ACCOUNT_SCHEMA,
+                },
+                "required": ["project_id", "node"],
+            },
+        ),
+        Tool(
+            name="set_project_thumbnail",
+            description="Set the thumbnail post for a project.",
+            inputSchema={
+                "type": "object",
+                "properties": {"project_id": {"type": "string"}, "post_id": {"type": "string"}, "cookies": COOKIE_SCHEMA, "account": ACCOUNT_SCHEMA},
+                "required": ["project_id", "post_id"],
+            },
+        ),
+        Tool(
+            name="list_templates",
+            description="List Grok Imagine pipeline templates (Short Film, UGC Product Stories, etc.).",
+            inputSchema={"type": "object", "properties": {"cookies": COOKIE_SCHEMA, "account": ACCOUNT_SCHEMA}},
+        ),
+        Tool(
+            name="get_template",
+            description="Get a Grok Imagine template summary by templateId.",
+            inputSchema={
+                "type": "object",
+                "properties": {"template_id": {"type": "string"}, "cookies": COOKIE_SCHEMA, "account": ACCOUNT_SCHEMA},
+                "required": ["template_id"],
+            },
+        ),
+        Tool(
+            name="list_folders",
+            description="List Grok Imagine folders.",
+            inputSchema={"type": "object", "properties": {"cookies": COOKIE_SCHEMA, "account": ACCOUNT_SCHEMA}},
+        ),
+        Tool(
+            name="get_post_folders",
+            description="List folders that a post belongs to.",
+            inputSchema={
+                "type": "object",
+                "properties": {"post_id": {"type": "string"}, "cookies": COOKIE_SCHEMA, "account": ACCOUNT_SCHEMA},
+                "required": ["post_id"],
+            },
+        ),
+        Tool(
+            name="list_posts",
+            description="List Grok Imagine posts owned or liked by the account.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "default": 40},
+                    "source": {"type": "string", "enum": ["MEDIA_POST_SOURCE_OWNED", "MEDIA_POST_SOURCE_LIKED"], "default": "MEDIA_POST_SOURCE_OWNED"},
+                    "safe": {"type": "boolean", "default": False},
+                    "cookies": COOKIE_SCHEMA,
+                    "account": ACCOUNT_SCHEMA,
+                },
+            },
+        ),
+        Tool(
+            name="list_project_posts",
+            description="Get a Grok project canvas (nodes + attached posts).",
+            inputSchema={
+                "type": "object",
+                "properties": {"project_id": {"type": "string"}, "cookies": COOKIE_SCHEMA, "account": ACCOUNT_SCHEMA},
+                "required": ["project_id"],
+            },
+        ),
+        Tool(
+            name="get_post",
+            description="Get a Grok media post by post_id.",
+            inputSchema={
+                "type": "object",
+                "properties": {"post_id": {"type": "string"}, "cookies": COOKIE_SCHEMA, "account": ACCOUNT_SCHEMA},
+                "required": ["post_id"],
+            },
+        ),
+        Tool(
+            name="like_post",
+            description="Like a Grok media post.",
+            inputSchema={
+                "type": "object",
+                "properties": {"post_id": {"type": "string"}, "cookies": COOKIE_SCHEMA, "account": ACCOUNT_SCHEMA},
+                "required": ["post_id"],
+            },
+        ),
+        Tool(
+            name="delete_post",
+            description="Delete a Grok media post.",
+            inputSchema={
+                "type": "object",
+                "properties": {"post_id": {"type": "string"}, "cookies": COOKIE_SCHEMA, "account": ACCOUNT_SCHEMA},
+                "required": ["post_id"],
+            },
+        ),
+        Tool(
+            name="search_status",
+            description="Return Grok Imagine media search index status.",
+            inputSchema={"type": "object", "properties": {"cookies": COOKIE_SCHEMA, "account": ACCOUNT_SCHEMA}},
+        ),
+        Tool(
+            name="agent_start",
+            description="Start Grok Imagine Agent conversation (optionally inside a project).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "project_id": {"type": "string"},
+                    "extra": {"type": "object"},
+                    "cookies": COOKIE_SCHEMA,
+                    "account": ACCOUNT_SCHEMA,
+                },
+                "required": ["prompt"],
+            },
+        ),
+        Tool(
+            name="agent_send",
+            description="Send a follow-up prompt to a Grok Imagine Agent conversation.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "conversation_id": {"type": "string"},
+                    "prompt": {"type": "string"},
+                    "extra": {"type": "object"},
+                    "cookies": COOKIE_SCHEMA,
+                    "account": ACCOUNT_SCHEMA,
+                },
+                "required": ["conversation_id", "prompt"],
+            },
+        ),
+        Tool(
+            name="agent_read",
+            description="Load recent responses of a Grok Imagine Agent conversation.",
+            inputSchema={
+                "type": "object",
+                "properties": {"conversation_id": {"type": "string"}, "cookies": COOKIE_SCHEMA, "account": ACCOUNT_SCHEMA},
+                "required": ["conversation_id"],
+            },
+        ),
     ]
 
 
@@ -906,6 +1290,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             arguments["prompt"],
             int(arguments.get("timeout", 180)),
         )
+        if arguments.get("send_to_telegram") and result.get("status") == "ready":
+            try:
+                result["telegram"] = await send_generation_to_telegram(cookies, result, "image", arguments)
+            except Exception as e:
+                result["telegram_error"] = str(e)
         return json_text(result)
 
     if name == "generate_video":
@@ -924,6 +1313,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             share = await create_share_link(cookies, target_post_id)
             result["share"] = share
             result["public_video_url"] = public_video_url_from_share(share)
+        if arguments.get("send_to_telegram") and result.get("status") == "ready":
+            try:
+                result["telegram"] = await send_generation_to_telegram(cookies, result, "video", arguments)
+            except Exception as e:
+                result["telegram_error"] = str(e)
         return json_text(result)
 
     if name == "image_to_video":
@@ -964,6 +1358,86 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     if name == "check_quota":
         result = await grok_request("POST", "/rest/media/imagine/quota_info", cookies, {})
         return json_text(result)
+
+    if name == "send_to_telegram":
+        kind = arguments.get("kind", "video")
+        post = await get_media_post(cookies, arguments["post_id"])
+        if not post:
+            raise ValueError(f"Post {arguments['post_id']} not found")
+        urls = collect_media_urls(post)
+        wrap = {"post_id": arguments["post_id"], **urls, "post": post}
+        result = await send_generation_to_telegram(cookies, wrap, kind, arguments)
+        return json_text({"post_id": arguments["post_id"], **urls, **result})
+
+    if name == "list_projects":
+        return json_text(await list_projects(cookies))
+
+    if name == "create_project":
+        return json_text(await create_project(cookies, arguments["name"]))
+
+    if name == "get_project_conversations":
+        return json_text(await get_project_conversations(cookies, arguments["project_id"]))
+
+    if name == "create_project_node":
+        return json_text(await create_project_node(cookies, arguments["project_id"], arguments["node"]))
+
+    if name == "set_project_thumbnail":
+        return json_text(await set_project_thumbnail(cookies, arguments["project_id"], arguments["post_id"]))
+
+    if name == "list_templates":
+        return json_text(await list_templates(cookies))
+
+    if name == "get_template":
+        return json_text(await get_template(cookies, arguments["template_id"]))
+
+    if name == "list_folders":
+        return json_text(await list_folders(cookies))
+
+    if name == "get_post_folders":
+        return json_text(await get_post_folders(cookies, arguments["post_id"]))
+
+    if name == "list_posts":
+        return json_text(await list_posts(
+            cookies,
+            int(arguments.get("limit", 40)),
+            arguments.get("source", "MEDIA_POST_SOURCE_OWNED"),
+            bool(arguments.get("safe", False)),
+        ))
+
+    if name == "list_project_posts":
+        return json_text(await list_project_posts(cookies, arguments["project_id"]))
+
+    if name == "get_post":
+        post = await get_media_post(cookies, arguments["post_id"])
+        if not post:
+            raise ValueError(f"Post {arguments['post_id']} not found")
+        urls = collect_media_urls(post)
+        return json_text({"post_id": arguments["post_id"], **urls, "post": post})
+
+    if name == "like_post":
+        return json_text(await like_post(cookies, arguments["post_id"]))
+
+    if name == "delete_post":
+        return json_text(await delete_post(cookies, arguments["post_id"]))
+
+    if name == "search_status":
+        return json_text(await search_status(cookies))
+
+    if name == "agent_start":
+        events = await start_agent_conversation(cookies, arguments.get("project_id"), arguments["prompt"], arguments.get("extra"))
+        cid = None
+        for event in events:
+            cid = extract_conversation_id(event) if isinstance(event, dict) else None
+            if cid:
+                break
+        return json_text({"conversation_id": cid, "events": events})
+
+    if name == "agent_send":
+        events = await send_agent_prompt(cookies, arguments["conversation_id"], arguments["prompt"], arguments.get("extra"))
+        return json_text({"conversation_id": arguments["conversation_id"], "events": events})
+
+    if name == "agent_read":
+        return json_text(await read_agent_conversation(cookies, arguments["conversation_id"]))
 
     raise ValueError(f"Unknown tool: {name}")
 
