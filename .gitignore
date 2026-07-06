@@ -3,5 +3,6 @@ __pycache__/
 *.py[cod]
 .env
 cookies.json
+cookies/
 *.log
 .DS_Store

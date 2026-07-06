@@ -22,6 +22,7 @@ GROK_API_BASE = "https://grok.com"
 ASSETS_BASE = "https://assets.grok.com"
 IMAGINE_PUBLIC_BASE = "https://imagine-public.x.ai/imagine-public"
 COOKIE_FILE = Path(__file__).with_name("cookies.json")
+COOKIES_DIR = Path(__file__).with_name("cookies")
 BROWSER_STATE: dict[str, Any] = {"port": None, "ws_url": None}
 
 
@@ -95,9 +96,36 @@ async def cdp_call(ws, msg_id: int, method: str, params: dict[str, Any] | None =
             return msg.get("result", {})
 
 
+STATSIG_SNIFFER_JS = r"""
+(() => {
+  if (window.__grokSnifferInstalled) return;
+  window.__grokSnifferInstalled = true;
+  const origFetch = window.fetch;
+  window.fetch = function(input, init) {
+    try {
+      const headers = init && init.headers;
+      if (headers) {
+        const get = (name) => {
+          if (headers instanceof Headers) return headers.get(name);
+          if (Array.isArray(headers)) { const h = headers.find(h => (h[0]||'').toLowerCase() === name); return h ? h[1] : null; }
+          for (const k of Object.keys(headers)) if (k.toLowerCase() === name) return headers[k];
+          return null;
+        };
+        const s = get('x-statsig-id');
+        if (s) window.__grokStatsigId = s;
+      }
+    } catch(e) {}
+    return origFetch.apply(this, arguments);
+  };
+})();
+"""
+
+
 async def inject_browser_cookies(ws_url: str, cookies: dict[str, str]) -> None:
     async with websockets.connect(ws_url) as ws:
         await cdp_call(ws, 1, "Network.enable")
+        await cdp_call(ws, 2, "Page.enable")
+        await cdp_call(ws, 3, "Page.addScriptToEvaluateOnNewDocument", {"source": STATSIG_SNIFFER_JS})
         for i, (name, value) in enumerate(cookies.items(), start=10):
             await cdp_call(ws, i, "Network.setCookie", {
                 "name": name,
@@ -117,19 +145,40 @@ def js_literal(value: Any) -> str:
 
 async def browser_fetch(path: str, cookies: dict[str, str], payload: dict[str, Any], stream: bool = False) -> Any:
     ws_url = await ensure_browser(cookies)
-    js = f"""
+    async with websockets.connect(ws_url, max_size=64 * 1024 * 1024) as ws:
+        await cdp_call(ws, 1900, "Runtime.evaluate", {"expression": STATSIG_SNIFFER_JS})
+        for wait_id in range(50):
+            statsig = await cdp_call(ws, 1950 + wait_id, "Runtime.evaluate", {
+                "expression": "window.__grokStatsigId || null",
+                "returnByValue": True,
+            })
+            if statsig.get("result", {}).get("value"):
+                break
+            if wait_id == 0:
+                await cdp_call(ws, 1980, "Runtime.evaluate", {
+                    "expression": "fetch('/rest/media/imagine/quota_info', {method:'POST', credentials:'include', headers:{'content-type':'application/json'}, body:'{}'}).catch(()=>null)",
+                })
+            await asyncio.sleep(0.4)
+
+        js = f"""
 async () => {{
+  const headers = {{
+    'accept': '*/*',
+    'content-type': 'application/json',
+    'x-xai-request-id': crypto.randomUUID(),
+  }};
+  if (window.__grokStatsigId) headers['x-statsig-id'] = window.__grokStatsigId;
   const response = await fetch({js_literal(path)}, {{
     method: 'POST',
     credentials: 'include',
-    headers: {{'content-type': 'application/json', 'accept': '*/*'}},
+    headers,
+    referrer: 'https://grok.com/imagine',
     body: JSON.stringify({js_literal(payload)})
   }});
   const text = await response.text();
-  return {{ok: response.ok, status: response.status, text}};
+  return {{ok: response.ok, status: response.status, text, sentHeaders: headers}};
 }}
 """
-    async with websockets.connect(ws_url, max_size=64 * 1024 * 1024) as ws:
         result = await cdp_call(ws, 2000, "Runtime.evaluate", {
             "expression": f"({js})()",
             "awaitPromise": True,
@@ -150,16 +199,38 @@ async () => {{
     return json.loads(value["text"])
 
 
-def load_cookie_file() -> dict[str, str]:
-    if not COOKIE_FILE.exists():
-        return {}
-
-    cookies = json.loads(COOKIE_FILE.read_text(encoding="utf-8"))
-    if isinstance(cookies, dict):
-        return {normalize_cookie_name(k): str(v) for k, v in cookies.items() if v}
-    if isinstance(cookies, list):
-        return {normalize_cookie_name(c["name"]): c["value"] for c in cookies if c.get("name") and c.get("value")}
+def parse_cookie_payload(data: Any) -> dict[str, str]:
+    if isinstance(data, dict):
+        return {normalize_cookie_name(k): str(v) for k, v in data.items() if v}
+    if isinstance(data, list):
+        return {normalize_cookie_name(c["name"]): c["value"] for c in data if c.get("name") and c.get("value")}
     return {}
+
+
+def read_cookie_file(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    return parse_cookie_payload(json.loads(path.read_text(encoding="utf-8")))
+
+
+def resolve_account_path(account: str) -> Path:
+    candidate = COOKIES_DIR / f"{account}.json"
+    if not candidate.exists():
+        available = list_accounts()
+        raise FileNotFoundError(f"cookies/{account}.json not found. Available accounts: {available}")
+    return candidate
+
+
+def list_accounts() -> list[str]:
+    if not COOKIES_DIR.exists():
+        return []
+    return sorted(p.stem for p in COOKIES_DIR.glob("*.json"))
+
+
+def load_cookie_file(account: str | None = None) -> dict[str, str]:
+    if account:
+        return read_cookie_file(resolve_account_path(account))
+    return read_cookie_file(COOKIE_FILE)
 
 
 def normalize_cookie_name(name: str) -> str:
@@ -167,10 +238,14 @@ def normalize_cookie_name(name: str) -> str:
 
 
 def resolve_cookies(arguments: dict[str, Any]) -> dict[str, str]:
-    raw = arguments.get("cookies") or load_cookie_file()
+    account = arguments.get("account")
+    if account:
+        raw = load_cookie_file(account)
+    else:
+        raw = arguments.get("cookies") or load_cookie_file()
     cookies = {normalize_cookie_name(k): str(v) for k, v in raw.items() if v}
     if not cookies:
-        raise ValueError("Pass cookies or create cookies.json next to server.py")
+        raise ValueError(f"No cookies found. Available accounts: {list_accounts() or 'none'}. Pass account, pass cookies, or create cookies.json next to server.py")
     return cookies
 
 
@@ -579,24 +654,21 @@ def image_payload(arguments: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def video_payload(arguments: dict[str, Any], parent_post_id: str | None = None) -> dict[str, Any]:
+def video_payload(arguments: dict[str, Any], parent_post_id: str) -> dict[str, Any]:
     mode = arguments.get("mode", "custom")
     prompt = arguments["prompt"]
     image_url = arguments.get("image_url")
     message = f"{image_url}  {prompt} --mode={mode}" if image_url else f"{prompt} --mode={mode}"
     config: dict[str, Any] = {
-        "aspectRatio": arguments.get("aspect_ratio", "16:9"),
+        "parentPostId": parent_post_id,
+        "aspectRatio": arguments.get("aspect_ratio", "2:3"),
         "videoLength": int(arguments.get("duration", 6)),
-        "isVideoEdit": bool(arguments.get("is_video_edit", False)),
         "resolutionName": arguments.get("resolution", "480p"),
     }
-    if parent_post_id:
-        config["parentPostId"] = parent_post_id
     payload = {
         "temporary": True,
-        "modelName": "grok-3",
+        "modelName": "imagine-video-gen",
         "message": message,
-        "toolOverrides": {"videoGen": True},
         "enableSideBySide": True,
         "responseMetadata": {
             "experiments": [],
@@ -606,6 +678,35 @@ def video_payload(arguments: dict[str, Any], parent_post_id: str | None = None) 
     if arguments.get("extra"):
         payload.update(arguments["extra"])
     return payload
+
+
+async def start_video_generation(cookies: dict[str, str], payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return await browser_fetch("/rest/app-chat/conversations/new", cookies, payload, stream=True)
+
+
+def extract_video_ids(events: list[dict[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {"progress": 0}
+    for event in events:
+        for node in deep_values(event):
+            video = node.get("streamingVideoGenerationResponse")
+            if not isinstance(video, dict):
+                continue
+            for key in ("progress", "videoPostId", "videoId", "parentPostId", "resolutionName", "width", "height", "moderated"):
+                if video.get(key) is not None:
+                    result[key] = video[key]
+    return result
+
+
+async def wait_for_video_url(cookies: dict[str, str], post_id: str, timeout: int, poll_interval: int = 5) -> dict[str, Any]:
+    latest: dict[str, Any] = {}
+    for _ in range(max(timeout // poll_interval, 1)):
+        latest = await get_media_post(cookies, post_id) or {}
+        urls = collect_media_urls(latest)
+        if urls["video_urls"]:
+            return {"status": "ready", **post_summary({"post": latest}), **urls}
+        await asyncio.sleep(poll_interval)
+    urls = collect_media_urls(latest) if latest else {"image_urls": [], "video_urls": [], "audio_urls": []}
+    return {"status": "timeout", **post_summary({"post": latest}), **urls}
 
 
 async def run_streaming_generation(cookies: dict[str, str], payload: dict[str, Any], video: bool = False) -> tuple[str | None, list[dict[str, Any]]]:
@@ -629,8 +730,12 @@ def json_text(data: dict[str, Any]) -> list[TextContent]:
 
 COOKIE_SCHEMA = {
     "type": "object",
-    "description": "Optional Grok cookies. If omitted, server reads cookies.json next to server.py.",
+    "description": "Optional Grok cookies. If omitted, server uses account or cookies.json.",
     "additionalProperties": {"type": "string"},
+}
+ACCOUNT_SCHEMA = {
+    "type": "string",
+    "description": "Optional Grok account name from cookies/<name>.json. Overrides cookies.json if provided.",
 }
 
 
@@ -639,6 +744,7 @@ async def list_tools() -> list[Tool]:
     common_generation_fields = {
         "prompt": {"type": "string"},
         "cookies": COOKIE_SCHEMA,
+        "account": ACCOUNT_SCHEMA,
         "aspect_ratio": {"type": "string", "description": "Examples: 16:9, 9:16, 1:1, 2:3, 3:2"},
         "extra": {"type": "object", "description": "Optional payload fields merged into the Grok request."},
     }
@@ -657,6 +763,7 @@ async def list_tools() -> list[Tool]:
                     "conversation_id": {"type": "string"},
                     "prompt": {"type": "string"},
                     "cookies": COOKIE_SCHEMA,
+                    "account": ACCOUNT_SCHEMA,
                     "extra": {"type": "object"},
                 },
                 "required": ["conversation_id", "prompt"],
@@ -667,7 +774,7 @@ async def list_tools() -> list[Tool]:
             description="Read responses from a Grok Imagine Agent conversation.",
             inputSchema={
                 "type": "object",
-                "properties": {"conversation_id": {"type": "string"}, "cookies": COOKIE_SCHEMA},
+                "properties": {"conversation_id": {"type": "string"}, "cookies": COOKIE_SCHEMA, "account": ACCOUNT_SCHEMA},
                 "required": ["conversation_id"],
             },
         ),
@@ -731,6 +838,7 @@ async def list_tools() -> list[Tool]:
                     "prompt": {"type": "string"},
                     "media_url": {"type": "string"},
                     "cookies": COOKIE_SCHEMA,
+                    "account": ACCOUNT_SCHEMA,
                 },
             },
         ),
@@ -739,7 +847,7 @@ async def list_tools() -> list[Tool]:
             description="Create a share link for a Grok media post.",
             inputSchema={
                 "type": "object",
-                "properties": {"post_id": {"type": "string"}, "cookies": COOKIE_SCHEMA},
+                "properties": {"post_id": {"type": "string"}, "cookies": COOKIE_SCHEMA, "account": ACCOUNT_SCHEMA},
                 "required": ["post_id"],
             },
         ),
@@ -748,20 +856,27 @@ async def list_tools() -> list[Tool]:
             description="Ask Grok to upscale a generated video by video_id.",
             inputSchema={
                 "type": "object",
-                "properties": {"video_id": {"type": "string"}, "cookies": COOKIE_SCHEMA},
+                "properties": {"video_id": {"type": "string"}, "cookies": COOKIE_SCHEMA, "account": ACCOUNT_SCHEMA},
                 "required": ["video_id"],
             },
         ),
         Tool(
             name="check_quota",
             description="Return Grok Imagine quota_info.",
-            inputSchema={"type": "object", "properties": {"cookies": COOKIE_SCHEMA}},
+            inputSchema={"type": "object", "properties": {"cookies": COOKIE_SCHEMA, "account": ACCOUNT_SCHEMA}},
+        ),
+        Tool(
+            name="list_accounts",
+            description="List Grok accounts available in cookies/<name>.json.",
+            inputSchema={"type": "object", "properties": {}},
         ),
     ]
 
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+    if name == "list_accounts":
+        return json_text({"accounts": list_accounts(), "default_cookies_json_present": COOKIE_FILE.exists()})
     cookies = resolve_cookies(arguments)
 
     if name == "imagine_agent_start":
@@ -794,15 +909,19 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         return json_text(result)
 
     if name == "generate_video":
-        result = await create_and_wait_media(
-            cookies,
-            "MEDIA_POST_TYPE_VIDEO",
-            arguments["prompt"],
-            int(arguments.get("timeout", 300)),
-        )
-        post_id = result.get("post_id")
-        if arguments.get("share") and post_id:
-            share = await create_share_link(cookies, post_id)
+        parent_post_id = arguments.get("parent_post_id")
+        if not parent_post_id:
+            created = await create_media_post(cookies, media_type="MEDIA_POST_TYPE_VIDEO", prompt=arguments["prompt"])
+            parent_post_id = post_summary(created)["post_id"]
+        events = await start_video_generation(cookies, video_payload(arguments, parent_post_id))
+        ids = extract_video_ids(events)
+        if ids.get("moderated"):
+            return json_text({"status": "moderated", "parent_post_id": parent_post_id, **ids})
+        target_post_id = ids.get("videoPostId") or parent_post_id
+        result = await wait_for_video_url(cookies, target_post_id, int(arguments.get("timeout", 300)))
+        result.update({"parent_post_id": parent_post_id, "video_post_id": target_post_id, "progress": ids.get("progress")})
+        if arguments.get("share") and target_post_id and result.get("status") == "ready":
+            share = await create_share_link(cookies, target_post_id)
             result["share"] = share
             result["public_video_url"] = public_video_url_from_share(share)
         return json_text(result)
@@ -815,20 +934,16 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 raise ValueError("image_to_video requires image_url or parent_post_id")
             media_post = await create_media_post(cookies, media_url=arguments["image_url"])
             parent_post_id = post_summary(media_post)["post_id"]
-        cid, events = await run_streaming_generation(cookies, video_payload(arguments, parent_post_id), video=True)
-        state = extract_video_state(events)
-        if arguments.get("share") and (state.get("videoPostId") or state.get("postId")):
-            share = await create_share_link(cookies, state.get("videoPostId") or state["postId"])
-            state["share"] = share
-            state["public_video_url"] = public_video_url_from_share(share)
-        return json_text({
-            "status": "complete" if state.get("video_url") else "incomplete",
-            "conversation_id": cid,
-            "parent_post_id": parent_post_id,
-            "media_post": media_post,
-            **state,
-            "events": events,
-        })
+        events = await start_video_generation(cookies, video_payload(arguments, parent_post_id))
+        ids = extract_video_ids(events)
+        target_post_id = ids.get("videoPostId") or parent_post_id
+        result = await wait_for_video_url(cookies, target_post_id, int(arguments.get("timeout", 300)))
+        result.update({"parent_post_id": parent_post_id, "video_post_id": target_post_id, "media_post": media_post, "progress": ids.get("progress")})
+        if arguments.get("share") and target_post_id and result.get("status") == "ready":
+            share = await create_share_link(cookies, target_post_id)
+            result["share"] = share
+            result["public_video_url"] = public_video_url_from_share(share)
+        return json_text(result)
 
     if name == "create_media_post":
         result = await create_media_post(
