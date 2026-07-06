@@ -8,6 +8,7 @@ import re
 import subprocess
 import tempfile
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -47,11 +48,22 @@ def find_chrome() -> str | None:
     return None
 
 
-def launch_chrome(debug_port: int) -> None:
+CHROME_PROFILES_DIR = Path(__file__).with_name("chrome-profiles")
+
+
+def chrome_profile_dir(profile_key: str) -> Path:
+    CHROME_PROFILES_DIR.mkdir(exist_ok=True)
+    safe = re.sub(r"[^a-zA-Z0-9._-]", "_", profile_key)[:60] or "default"
+    path = CHROME_PROFILES_DIR / safe
+    path.mkdir(exist_ok=True)
+    return path
+
+
+def launch_chrome(debug_port: int, profile_key: str) -> None:
     chrome_path = find_chrome()
     if not chrome_path:
         raise RuntimeError("Chrome not found")
-    user_data = tempfile.mkdtemp(prefix="grok-mcp-")
+    user_data = str(chrome_profile_dir(profile_key))
     cmd = (
         f'start "" "{chrome_path}"'
         f" --remote-debugging-port={debug_port}"
@@ -73,7 +85,17 @@ async def get_cdp_page(debug_port: int) -> dict[str, Any] | None:
         return None
 
 
+def cookie_profile_key(cookies: dict[str, str]) -> str:
+    return cookies.get("grok_device_id") or (cookies.get("sso") or "")[:24] or "default"
+
+
 async def ensure_browser(cookies: dict[str, str]) -> str:
+    profile_key = cookie_profile_key(cookies)
+    if BROWSER_STATE.get("profile") != profile_key:
+        BROWSER_STATE["port"] = None
+        BROWSER_STATE["ws_url"] = None
+    BROWSER_STATE["profile"] = profile_key
+
     port = BROWSER_STATE.get("port")
     if port:
         page = await get_cdp_page(port)
@@ -82,7 +104,7 @@ async def ensure_browser(cookies: dict[str, str]) -> str:
             return page["webSocketDebuggerUrl"]
 
     debug_port = random.randint(9401, 9499)
-    launch_chrome(debug_port)
+    launch_chrome(debug_port, profile_key)
     for _ in range(30):
         await asyncio.sleep(0.5)
         page = await get_cdp_page(debug_port)
@@ -712,19 +734,24 @@ async def search_status(cookies: dict[str, str]) -> dict[str, Any]:
     return await grok_call("/rest/media/search/status", cookies, {})
 
 
-async def start_agent_conversation(cookies: dict[str, str], project_id: str | None, first_prompt: str, extra: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+async def start_agent_conversation(cookies: dict[str, str], project_id: str | None, first_prompt: str, extra: dict[str, Any] | None = None) -> tuple[str | None, list[dict[str, Any]]]:
+    init_payload: dict[str, Any] = {"temporary": False}
+    if project_id:
+        init_payload["canvasId"] = project_id
+    created = await browser_fetch("/rest/app-chat/conversations", cookies, init_payload, stream=False)
+    cid = created.get("conversationId") if isinstance(created, dict) else None
+    if not cid:
+        raise RuntimeError(f"Agent conversation init failed: {created}")
     payload: dict[str, Any] = {
-        "temporary": False,
-        "modeId": "imagine-agent-mode-dev",
         "message": first_prompt,
+        "modeId": "imagine-agent-mode-dev",
         "enableImageGeneration": True,
         "enableImageStreaming": True,
     }
-    if project_id:
-        payload["canvasId"] = project_id
     if extra:
         payload.update(extra)
-    return await browser_fetch("/rest/app-chat/conversations/new", cookies, payload, stream=True)
+    events = await browser_fetch(f"/rest/app-chat/conversations/{cid}/responses", cookies, payload, stream=True)
+    return cid, events
 
 
 async def send_agent_prompt(cookies: dict[str, str], conversation_id_value: str, message: str, extra: dict[str, Any] | None = None) -> Any:
@@ -741,6 +768,212 @@ async def send_agent_prompt(cookies: dict[str, str], conversation_id_value: str,
 
 async def read_agent_conversation(cookies: dict[str, str], conversation_id_value: str) -> dict[str, Any]:
     return await grok_call(f"/rest/app-chat/conversations/{conversation_id_value}/load-responses", cookies, {})
+
+
+SERIES_DIR = Path(__file__).with_name("series")
+
+
+async def grok_chat(cookies: dict[str, str], prompt: str, mode_id: str = "fast") -> tuple[str, str | None, list[dict[str, Any]]]:
+    created = await browser_fetch("/rest/app-chat/conversations", cookies, {"temporary": True}, stream=False)
+    cid = created.get("conversationId") if isinstance(created, dict) else None
+    if not cid:
+        raise RuntimeError(f"Grok chat init failed: {created}")
+    payload = {
+        "message": prompt,
+        "modeId": mode_id,
+        "temporary": True,
+        "disableSearch": False,
+        "enableImageGeneration": False,
+        "enableImageStreaming": False,
+        "imageGenerationCount": 0,
+        "returnImageBytes": False,
+        "returnRawGrokInXaiRequest": False,
+        "imageAttachments": [],
+        "fileAttachments": [],
+        "enableSideBySide": False,
+        "sendFinalMetadata": True,
+        "responseMetadata": {"experiments": []},
+    }
+    events = await browser_fetch(f"/rest/app-chat/conversations/{cid}/responses", cookies, payload, stream=True)
+    tokens: list[str] = []
+    cid: str | None = None
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        response = event.get("result", {}).get("response") if isinstance(event.get("result"), dict) else None
+        if isinstance(response, dict):
+            token = response.get("token")
+            if isinstance(token, str) and not response.get("isThinking") and not response.get("messageStepId"):
+                tokens.append(token)
+    return "".join(tokens), cid, events
+
+
+def extract_json_block(text: str) -> Any:
+    start = min([i for i in (text.find("["), text.find("{")) if i >= 0], default=-1)
+    if start < 0:
+        raise ValueError(f"No JSON found in Grok response: {text[:400]}")
+    depth = 0
+    in_string = False
+    escape = False
+    opener = text[start]
+    closer = "]" if opener == "[" else "}"
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == opener:
+            depth += 1
+        elif ch == closer:
+            depth -= 1
+            if depth == 0:
+                return json.loads(text[start : i + 1])
+    raise ValueError(f"Unbalanced JSON in Grok response: {text[start:start+400]}")
+
+
+def series_path(series_id: str) -> Path:
+    SERIES_DIR.mkdir(exist_ok=True)
+    safe = re.sub(r"[^a-zA-Z0-9._-]", "_", series_id)[:60]
+    return SERIES_DIR / f"{safe}.json"
+
+
+def new_series_id(topic: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", topic.lower()).strip("-")[:32] or "series"
+    stamp = uuid.uuid4().hex[:6]
+    return f"{slug}-{stamp}"
+
+
+def load_series(series_id: str) -> dict[str, Any]:
+    path = series_path(series_id)
+    if not path.exists():
+        raise FileNotFoundError(f"Series {series_id} not found")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_series(state: dict[str, Any]) -> Path:
+    path = series_path(state["id"])
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def list_series_files() -> list[dict[str, Any]]:
+    if not SERIES_DIR.exists():
+        return []
+    items: list[dict[str, Any]] = []
+    for path in sorted(SERIES_DIR.glob("*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            items.append({
+                "id": data.get("id"),
+                "topic": data.get("topic"),
+                "episodes": len(data.get("episodes", [])),
+                "scenes": sum(len(ep.get("scenes", [])) for ep in data.get("episodes", [])),
+                "updated_at": data.get("updated_at"),
+                "path": str(path),
+            })
+        except Exception as e:
+            items.append({"path": str(path), "error": str(e)})
+    return items
+
+
+def build_plan_prompt(topic: str, episodes: int, scenes_per_episode: int, style: str | None, duration: int) -> str:
+    style_line = f"Style/notes: {style}\n" if style else ""
+    return (
+        f"You are the ScriptAgent for a short video series generated with Grok Imagine.\n"
+        f"Topic: {topic}\n"
+        f"Episodes: {episodes}\n"
+        f"Scenes per episode: {scenes_per_episode}\n"
+        f"Target scene duration: {duration} seconds\n"
+        f"{style_line}"
+        f"Return ONLY valid JSON in this shape and nothing else:\n"
+        "{\n"
+        '  "title": string,\n'
+        '  "logline": string,\n'
+        '  "consistency": {"characters": [string], "setting": string, "style": string, "palette": string},\n'
+        '  "episodes": [\n'
+        "    {\n"
+        '      "episode_number": number,\n'
+        '      "title": string,\n'
+        '      "summary": string,\n'
+        '      "scenes": [\n'
+        "        {\n"
+        '          "scene_number": number,\n'
+        '          "description": string,\n'
+        '          "prompt": string,\n'
+        '          "aspect_ratio": "2:3"|"3:2"|"1:1"|"9:16"|"16:9",\n'
+        '          "duration": number\n'
+        "        }\n"
+        "      ]\n"
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        "Every scene.prompt must be a self-contained Grok Imagine prompt with the character, action, camera hint, lighting, and style. No commentary outside JSON."
+    )
+
+
+async def plan_series(
+    cookies: dict[str, str],
+    topic: str,
+    episodes: int = 1,
+    scenes_per_episode: int = 3,
+    style: str | None = None,
+    duration: int = 6,
+) -> dict[str, Any]:
+    prompt = build_plan_prompt(topic, episodes, scenes_per_episode, style, duration)
+    text, cid, _ = await grok_chat(cookies, prompt)
+    plan = extract_json_block(text)
+    if not isinstance(plan, dict):
+        raise ValueError(f"Grok plan is not an object: {text[:400]}")
+    series_id = new_series_id(topic)
+    for episode in plan.get("episodes", []):
+        for scene in episode.get("scenes", []):
+            scene.setdefault("status", "planned")
+    now = _now_iso()
+    state = {
+        "id": series_id,
+        "topic": topic,
+        "created_at": now,
+        "updated_at": now,
+        "planner_conversation_id": cid,
+        "settings": {
+            "episodes": episodes,
+            "scenes_per_episode": scenes_per_episode,
+            "duration": duration,
+            "style": style,
+        },
+        "plan_raw_text": text,
+        **plan,
+    }
+    save_series(state)
+    return state
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def find_scene(state: dict[str, Any], episode_number: int, scene_number: int) -> dict[str, Any]:
+    for episode in state.get("episodes", []):
+        if int(episode.get("episode_number", 0)) == episode_number:
+            for scene in episode.get("scenes", []):
+                if int(scene.get("scene_number", 0)) == scene_number:
+                    return scene
+    raise ValueError(f"Scene {episode_number}.{scene_number} not found in series {state.get('id')}")
+
+
+def update_scene_state(state: dict[str, Any], episode_number: int, scene_number: int, updates: dict[str, Any]) -> dict[str, Any]:
+    scene = find_scene(state, episode_number, scene_number)
+    scene.update(updates)
+    state["updated_at"] = _now_iso()
+    return scene
 
 
 async def create_share_link(cookies: dict[str, str], post_id: str) -> dict[str, Any]:
@@ -1254,6 +1487,51 @@ async def list_tools() -> list[Tool]:
                 "required": ["conversation_id"],
             },
         ),
+        Tool(
+            name="plan_series",
+            description="Ask Grok to plan a video series (episodes + scenes + prompts) and save it to series/<id>.json.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "topic": {"type": "string"},
+                    "episodes": {"type": "integer", "default": 1},
+                    "scenes_per_episode": {"type": "integer", "default": 3},
+                    "duration": {"type": "integer", "default": 6, "description": "Target scene duration in seconds"},
+                    "style": {"type": "string", "description": "Optional style / audience / tone notes"},
+                    "cookies": COOKIE_SCHEMA,
+                    "account": ACCOUNT_SCHEMA,
+                },
+                "required": ["topic"],
+            },
+        ),
+        Tool(
+            name="list_series",
+            description="List series files stored in series/*.json.",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        Tool(
+            name="get_series",
+            description="Return the full series JSON by id.",
+            inputSchema={
+                "type": "object",
+                "properties": {"series_id": {"type": "string"}},
+                "required": ["series_id"],
+            },
+        ),
+        Tool(
+            name="update_scene",
+            description="Update fields on a specific scene (status, prompt, aspect_ratio, video_url, ...).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "series_id": {"type": "string"},
+                    "episode_number": {"type": "integer"},
+                    "scene_number": {"type": "integer"},
+                    "updates": {"type": "object"},
+                },
+                "required": ["series_id", "episode_number", "scene_number", "updates"],
+            },
+        ),
     ]
 
 
@@ -1424,12 +1702,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         return json_text(await search_status(cookies))
 
     if name == "agent_start":
-        events = await start_agent_conversation(cookies, arguments.get("project_id"), arguments["prompt"], arguments.get("extra"))
-        cid = None
-        for event in events:
-            cid = extract_conversation_id(event) if isinstance(event, dict) else None
-            if cid:
-                break
+        cid, events = await start_agent_conversation(cookies, arguments.get("project_id"), arguments["prompt"], arguments.get("extra"))
         return json_text({"conversation_id": cid, "events": events})
 
     if name == "agent_send":
@@ -1438,6 +1711,29 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
     if name == "agent_read":
         return json_text(await read_agent_conversation(cookies, arguments["conversation_id"]))
+
+    if name == "plan_series":
+        state = await plan_series(
+            cookies,
+            arguments["topic"],
+            int(arguments.get("episodes", 1)),
+            int(arguments.get("scenes_per_episode", 3)),
+            arguments.get("style"),
+            int(arguments.get("duration", 6)),
+        )
+        return json_text({"id": state["id"], "path": str(series_path(state["id"])), "series": state})
+
+    if name == "list_series":
+        return json_text({"series": list_series_files()})
+
+    if name == "get_series":
+        return json_text(load_series(arguments["series_id"]))
+
+    if name == "update_scene":
+        state = load_series(arguments["series_id"])
+        scene = update_scene_state(state, int(arguments["episode_number"]), int(arguments["scene_number"]), arguments["updates"])
+        save_series(state)
+        return json_text({"series_id": state["id"], "scene": scene, "updated_at": state["updated_at"]})
 
     raise ValueError(f"Unknown tool: {name}")
 
