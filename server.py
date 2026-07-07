@@ -173,7 +173,7 @@ def js_literal(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False).replace("</", "<\\/")
 
 
-async def browser_fetch(path: str, cookies: dict[str, str], payload: dict[str, Any], stream: bool = False) -> Any:
+async def browser_fetch(path: str, cookies: dict[str, str], payload: dict[str, Any], stream: bool = False, referrer: str | None = None) -> Any:
     ws_url = await ensure_browser(cookies)
     async with websockets.connect(ws_url, max_size=64 * 1024 * 1024) as ws:
         await cdp_call(ws, 1900, "Runtime.evaluate", {"expression": STATSIG_SNIFFER_JS})
@@ -192,17 +192,23 @@ async def browser_fetch(path: str, cookies: dict[str, str], payload: dict[str, A
 
         js = f"""
 async () => {{
+  const hex = (n) => Array.from(crypto.getRandomValues(new Uint8Array(n))).map(b => b.toString(16).padStart(2,'0')).join('');
+  const traceId = hex(16);
+  const spanId = hex(8);
   const headers = {{
     'accept': '*/*',
     'content-type': 'application/json',
     'x-xai-request-id': crypto.randomUUID(),
+    'baggage': `sentry-environment=production,sentry-release=3d7a5cb84968abcdf5fd26f942751e055decf599,sentry-public_key=b311e0f2690c81f25e2c4cf6d4f7ce1c,sentry-trace_id=${{traceId}},sentry-org_id=4508179396558848,sentry-sampled=false,sentry-sample_rand=${{Math.random().toFixed(16)}},sentry-sample_rate=0`,
+    'sentry-trace': `${{traceId}}-${{spanId}}-0`,
+    'traceparent': `00-${{hex(16)}}-${{hex(8)}}-00`,
   }};
   if (window.__grokStatsigId) headers['x-statsig-id'] = window.__grokStatsigId;
   const response = await fetch({js_literal(path)}, {{
     method: 'POST',
     credentials: 'include',
     headers,
-    referrer: 'https://grok.com/imagine',
+    referrer: {js_literal(referrer or 'https://grok.com/imagine')},
     body: JSON.stringify({js_literal(payload)})
   }});
   const text = await response.text();
@@ -735,7 +741,7 @@ async def search_status(cookies: dict[str, str]) -> dict[str, Any]:
 
 
 async def start_agent_conversation(cookies: dict[str, str], project_id: str | None, first_prompt: str, extra: dict[str, Any] | None = None) -> tuple[str | None, list[dict[str, Any]]]:
-    init_payload: dict[str, Any] = {"temporary": False}
+    init_payload: dict[str, Any] = {"systemPromptName": "", "temporary": False}
     if project_id:
         init_payload["canvasId"] = project_id
     created = await browser_fetch("/rest/app-chat/conversations", cookies, init_payload, stream=False)
@@ -744,13 +750,23 @@ async def start_agent_conversation(cookies: dict[str, str], project_id: str | No
         raise RuntimeError(f"Agent conversation init failed: {created}")
     payload: dict[str, Any] = {
         "message": first_prompt,
-        "modeId": "imagine-agent-mode-dev",
+        "parentResponseId": "",
+        "disableSearch": False,
         "enableImageGeneration": True,
+        "imageAttachments": [],
+        "fileAttachments": [],
         "enableImageStreaming": True,
+        "enableSideBySide": False,
+        "sendFinalMetadata": True,
+        "disableTextFollowUps": True,
+        "disableMemory": False,
+        "skipCancelCurrentInflightRequests": True,
+        "disabledConnectorIds": [],
+        "modeId": "imagine-agent-mode-dev",
     }
     if extra:
         payload.update(extra)
-    events = await browser_fetch(f"/rest/app-chat/conversations/{cid}/responses", cookies, payload, stream=True)
+    events = await browser_fetch(f"/rest/app-chat/conversations/{cid}/responses", cookies, payload, stream=True, referrer="https://grok.com/imagine/agent")
     return cid, events
 
 
@@ -773,39 +789,166 @@ async def read_agent_conversation(cookies: dict[str, str], conversation_id_value
 SERIES_DIR = Path(__file__).with_name("series")
 
 
+def collect_grok_text(events: list[dict[str, Any]]) -> str:
+    """Assemble the assistant text out of any known Grok streaming shape.
+    Handles both nested (result.response.token) and flat (result.token) layouts,
+    plus final `modelResponse.message` fallback."""
+    tokens: list[str] = []
+    finals: list[str] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        result = event.get("result")
+        if not isinstance(result, dict):
+            continue
+        candidates: list[dict[str, Any]] = [result]
+        nested = result.get("response")
+        if isinstance(nested, dict):
+            candidates.append(nested)
+        for node in candidates:
+            if node.get("isThinking"):
+                continue
+            tag = node.get("messageTag")
+            token = node.get("token")
+            if isinstance(token, str) and token and tag != "header":
+                tokens.append(token)
+            for key in ("modelResponse", "finalMessage", "message"):
+                block = node.get(key)
+                if isinstance(block, dict):
+                    for text_key in ("message", "text"):
+                        text_val = block.get(text_key)
+                        if isinstance(text_val, str) and text_val:
+                            finals.append(text_val)
+    if finals:
+        combined = "\n".join(finals)
+        joined_tokens = "".join(tokens)
+        return combined if len(combined) >= len(joined_tokens) else joined_tokens
+    return "".join(tokens)
+
+
+async def grok_chat_via_ui(cookies: dict[str, str], prompt: str, mode: str = "agent", timeout: int = 90) -> tuple[str, str | None, list[dict[str, Any]]]:
+    """Drive the real Grok UI so the anti-bot layer sees a genuine submit.
+    Returns (text_response, conversation_id, streaming_events)."""
+    ws_url = await ensure_browser(cookies)
+    target_url = "https://grok.com/imagine" if mode == "imagine" else "https://grok.com/imagine"
+    tab_label = "Агент" if mode == "agent" else ("Видео" if mode == "video" else "Изображение")
+
+    async with websockets.connect(ws_url, max_size=64 * 1024 * 1024) as ws:
+        await cdp_call(ws, 1, "Network.enable")
+        await cdp_call(ws, 2, "Runtime.enable")
+        await cdp_call(ws, 3, "Page.enable")
+        await cdp_call(ws, 4, "Page.navigate", {"url": target_url})
+        await asyncio.sleep(7)
+
+        setup_js = (
+            "async () => {\n"
+            "  const sleep = ms => new Promise(r => setTimeout(r, ms));\n"
+            "  for (const t of ['Подтвердить выбор','Confirm My Choices','Accept All','Согласиться с использованием всех файлов cookie','Get Started']) {\n"
+            "    const b = [...document.querySelectorAll('button')].find(x => (x.innerText||'').includes(t));\n"
+            "    if (b) { b.click(); await sleep(500); }\n"
+            "  }\n"
+            f"  const tab = [...document.querySelectorAll('button')].find(b => (b.innerText||'').trim() === {js_literal(tab_label)});\n"
+            "  if (tab) { tab.click(); await sleep(700); }\n"
+            "  const box = document.querySelector('[role=\"textbox\"][contenteditable=\"true\"], [contenteditable=\"true\"][role=\"textbox\"]');\n"
+            "  if (!box) return {err:'no textbox'};\n"
+            "  box.focus();\n"
+            "  document.execCommand('selectAll', false, null);\n"
+            "  document.execCommand('delete', false, null);\n"
+            f"  document.execCommand('insertText', false, {js_literal(prompt)});\n"
+            "  box.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText'}));\n"
+            "  await sleep(600);\n"
+            "  const submit = [...document.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === 'Отправить' || b.getAttribute('aria-label') === 'Send');\n"
+            "  if (!submit) return {err:'no submit', text: box.innerText};\n"
+            "  const r = submit.getBoundingClientRect();\n"
+            "  ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(t => {\n"
+            "    const cls = t.startsWith('pointer') ? PointerEvent : MouseEvent;\n"
+            "    submit.dispatchEvent(new cls(t, {bubbles:true, cancelable:true, clientX:r.x+r.width/2, clientY:r.y+r.height/2, button:0}));\n"
+            "  });\n"
+            "  return {ok:true};\n"
+            "}"
+        )
+        setup = await cdp_call(ws, 5, "Runtime.evaluate", {"expression": f"({setup_js})()", "awaitPromise": True, "returnByValue": True})
+        setup_val = setup.get("result", {}).get("value")
+        if not setup_val or setup_val.get("err"):
+            raise RuntimeError(f"Grok UI setup failed: {setup_val}")
+
+        request_id: str | None = None
+        conv_id: str | None = None
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline and not request_id:
+            try:
+                msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=1))
+            except asyncio.TimeoutError:
+                continue
+            if msg.get("method") == "Network.requestWillBeSent":
+                url = msg.get("params", {}).get("request", {}).get("url", "")
+                if "/rest/app-chat/conversations/" in url and url.endswith("/responses"):
+                    request_id = msg["params"]["requestId"]
+                    match = re.search(r"/conversations/([0-9a-fA-F-]+)/responses", url)
+                    if match:
+                        conv_id = match.group(1)
+
+        if not request_id:
+            debug_state = await cdp_call(ws, 90, "Runtime.evaluate", {
+                "expression": "(()=>{const b=document.querySelector('[role=\"textbox\"][contenteditable=\"true\"]'); const s=[...document.querySelectorAll('button')].find(b=>b.getAttribute('aria-label')==='Отправить'||b.getAttribute('aria-label')==='Send'); return {text: b && b.innerText, submit: !!s, disabled: s && s.disabled};})()",
+                "returnByValue": True,
+            })
+            raise RuntimeError(f"Grok UI submit did not fire /responses request. state={debug_state.get('result',{}).get('value')}")
+
+        events: list[dict[str, Any]] = []
+        finished = False
+        while asyncio.get_event_loop().time() < deadline and not finished:
+            try:
+                msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=1))
+            except asyncio.TimeoutError:
+                continue
+            method = msg.get("method")
+            if method == "Network.dataReceived" and msg.get("params", {}).get("requestId") == request_id:
+                continue
+            if method == "Network.loadingFinished" and msg.get("params", {}).get("requestId") == request_id:
+                finished = True
+                break
+            if method == "Network.loadingFailed" and msg.get("params", {}).get("requestId") == request_id:
+                raise RuntimeError(f"Grok /responses failed: {msg.get('params')}")
+
+        body = await cdp_call(ws, 6, "Network.getResponseBody", {"requestId": request_id})
+        raw = body.get("body", "") if body else ""
+        for line in raw.splitlines():
+            item = parse_stream_line(line)
+            if item is not None:
+                events.append(item)
+
+        return collect_grok_text(events), conv_id, events
+
+
 async def grok_chat(cookies: dict[str, str], prompt: str, mode_id: str = "fast") -> tuple[str, str | None, list[dict[str, Any]]]:
-    created = await browser_fetch("/rest/app-chat/conversations", cookies, {"temporary": True}, stream=False)
+    created = await browser_fetch(
+        "/rest/app-chat/conversations",
+        cookies,
+        {"systemPromptName": "", "temporary": False},
+        stream=False,
+    )
     cid = created.get("conversationId") if isinstance(created, dict) else None
     if not cid:
         raise RuntimeError(f"Grok chat init failed: {created}")
     payload = {
         "message": prompt,
-        "modeId": mode_id,
-        "temporary": True,
+        "parentResponseId": "",
         "disableSearch": False,
         "enableImageGeneration": False,
-        "enableImageStreaming": False,
-        "imageGenerationCount": 0,
-        "returnImageBytes": False,
-        "returnRawGrokInXaiRequest": False,
         "imageAttachments": [],
         "fileAttachments": [],
+        "enableImageStreaming": False,
         "enableSideBySide": False,
         "sendFinalMetadata": True,
-        "responseMetadata": {"experiments": []},
+        "disableTextFollowUps": True,
+        "disableMemory": False,
+        "skipCancelCurrentInflightRequests": True,
+        "disabledConnectorIds": [],
+        "modeId": mode_id,
     }
-    events = await browser_fetch(f"/rest/app-chat/conversations/{cid}/responses", cookies, payload, stream=True)
-    tokens: list[str] = []
-    cid: str | None = None
-    for event in events:
-        if not isinstance(event, dict):
-            continue
-        response = event.get("result", {}).get("response") if isinstance(event.get("result"), dict) else None
-        if isinstance(response, dict):
-            token = response.get("token")
-            if isinstance(token, str) and not response.get("isThinking") and not response.get("messageStepId"):
-                tokens.append(token)
-    return "".join(tokens), cid, events
+    events = await browser_fetch(f"/rest/app-chat/conversations/{cid}/responses", cookies, payload, stream=True, referrer="https://grok.com/imagine/agent")
+    return collect_grok_text(events), cid, events
 
 
 def extract_json_block(text: str) -> Any:
@@ -928,11 +1071,20 @@ async def plan_series(
     duration: int = 6,
 ) -> dict[str, Any]:
     prompt = build_plan_prompt(topic, episodes, scenes_per_episode, style, duration)
-    text, cid, _ = await grok_chat(cookies, prompt)
-    plan = extract_json_block(text)
-    if not isinstance(plan, dict):
-        raise ValueError(f"Grok plan is not an object: {text[:400]}")
+    try:
+        text, cid, _ = await grok_chat(cookies, prompt)
+    except Exception:
+        text, cid, _ = await grok_chat_via_ui(cookies, prompt, mode="agent", timeout=180)
     series_id = new_series_id(topic)
+    parse_error: str | None = None
+    plan: Any = None
+    try:
+        plan = extract_json_block(text)
+    except Exception as exc:
+        parse_error = str(exc)
+    if not isinstance(plan, dict):
+        parse_error = parse_error or f"Grok plan is not an object: {text[:200]}"
+        plan = {"title": topic, "logline": "", "consistency": {}, "episodes": []}
     for episode in plan.get("episodes", []):
         for scene in episode.get("scenes", []):
             scene.setdefault("status", "planned")
@@ -950,6 +1102,7 @@ async def plan_series(
             "style": style,
         },
         "plan_raw_text": text,
+        "plan_parse_error": parse_error,
         **plan,
     }
     save_series(state)
