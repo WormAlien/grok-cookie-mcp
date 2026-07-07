@@ -103,9 +103,19 @@ IN_FLIGHT: dict[str, asyncio.Task[Any]] = {}
 # per-chat pending edit target: {chat_id: (series_id, ep, sn)}
 PENDING_EDIT: dict[int, tuple[str, int, int]] = {}
 
+# per-chat active cookie account name
+ACTIVE_ACCOUNT: dict[int, str] = {}
+
+# quota_info cache: {account_name: (data_json, fetched_at_unix)}
+QUOTA_CACHE: dict[str, tuple[dict[str, Any], float]] = {}
+
 
 def scene_key(series_id: str, ep: int, sn: int) -> str:
     return f"{series_id}#{ep}.{sn}"
+
+
+def account_for(chat_id: int) -> str:
+    return ACTIVE_ACCOUNT.get(chat_id) or DEFAULT_ACCOUNT
 
 
 # ---------------------------------------------------------------------------
@@ -393,14 +403,162 @@ async def btn_help(msg: Message) -> None:
         return
     await msg.answer(
         "🎬 <b>Как это работает:</b>\n\n"
-        "1) <b>Новый сериал</b> → Grok Agent пишет план: эпизоды, сцены, промпты.\n"
-        "2) На карточке сериала — <i>Пройти по сценам</i>: wizard-навигация ⬅/➡.\n"
-        "3) Для каждой сцены: ✅ Одобрить · ♻️ Регенерировать промпт · ✏️ Правки.\n"
-        "4) 🎬 <b>Видео (Agent+voice)</b> — рендер через агентский режим, приходит уже с озвучкой.\n"
+        "1) <b>⚙️ Аккаунты</b> — выбери активный cookie-акк, посмотри остаточную квоту.\n"
+        "2) <b>🎬 Новый сериал</b> → присылай тему следующим сообщением, Grok Agent пишет план.\n"
+        "3) На карточке сериала — <i>Пройти по сценам</i>: wizard ⬅/➡, ✅ Одобрить · ♻️ Регенерировать · ✏️ Правки.\n"
+        "4) <b>🎬 Видео (Agent+voice)</b> — рендер сцены через агентский режим, приходит уже с озвучкой.\n"
         "5) На карточке сериала: <i>Одобрить все</i> и <i>Рендер одобренных</i> — массовые действия.\n\n"
         "Стейт живёт в <code>series/&lt;id&gt;.json</code>, видео — в <code>output/</code>.",
         parse_mode=ParseMode.HTML,
     )
+
+
+# ---------------------------------------------------------------------------
+# accounts + quota
+# ---------------------------------------------------------------------------
+
+def _pick_number_pairs(data: Any, prefix: str = "") -> list[tuple[str, Any]]:
+    """Pull integer/float fields anywhere in the quota tree so we can pretty-print."""
+    out: list[tuple[str, Any]] = []
+    if isinstance(data, dict):
+        for k, v in data.items():
+            name = f"{prefix}{k}" if not prefix else f"{prefix}.{k}"
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                out.append((name, v))
+            elif isinstance(v, (dict, list)):
+                out.extend(_pick_number_pairs(v, name))
+            elif isinstance(v, str) and v and ("Time" in k or "time" in k or "reset" in k.lower()):
+                out.append((name, v))
+    elif isinstance(data, list):
+        for i, item in enumerate(data):
+            out.extend(_pick_number_pairs(item, f"{prefix}[{i}]"))
+    return out
+
+
+def _format_quota(data: Any) -> str:
+    pairs = _pick_number_pairs(data)
+    if not pairs:
+        return "<i>quota_info вернул пусто</i>"
+    lines: list[str] = []
+    seen = set()
+    for k, v in pairs:
+        short = k.split(".")[-1]
+        if short in seen:
+            continue
+        seen.add(short)
+        lines.append(f"<code>{k}</code>: <b>{v}</b>")
+    return "\n".join(lines[:24])
+
+
+async def _fetch_quota(account: str) -> dict[str, Any]:
+    from server import grok_request
+    cookies = load_cookie_file(account)
+    return await grok_request("POST", "/rest/media/imagine/quota_info", cookies, {})
+
+
+def _accounts_kb(chat_id: int, accounts: list[str]) -> InlineKeyboardMarkup:
+    active = account_for(chat_id)
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for name in accounts:
+        label = ("✅ " if name == active else "🔘 ") + name
+        row.append(InlineKeyboardButton(text=label, callback_data=f"a|switch|{name}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton(text="🔄 Обновить квоту", callback_data=f"a|refresh|{active}"),
+        InlineKeyboardButton(text="📊 Все квоты", callback_data="a|refreshall|_"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _accounts_text(chat_id: int, accounts: list[str]) -> str:
+    active = account_for(chat_id)
+    lines = [
+        "<b>⚙️ Аккаунты</b>",
+        f"Активный: <code>{active}</code>",
+        "",
+    ]
+    for name in accounts:
+        icon = "✅" if name == active else "🔘"
+        cached = QUOTA_CACHE.get(name)
+        if cached:
+            data, ts = cached
+            age = int(asyncio.get_event_loop().time() - ts)
+            summary = _format_quota(data)
+            lines.append(f"{icon} <b>{name}</b>  <i>({age}s назад)</i>")
+            lines.append(summary)
+        else:
+            lines.append(f"{icon} <b>{name}</b>  <i>квота не запрошена</i>")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+async def _send_accounts_panel(bot: Bot, chat_id: int, edit_message_id: int | None = None) -> None:
+    from server import list_accounts as _la
+    accounts = _la()
+    if not accounts:
+        await bot.send_message(chat_id, "Нет cookie-файлов в <code>cookies/</code>. Положи туда JSON от Cookie-Editor.", parse_mode=ParseMode.HTML)
+        return
+    text = _accounts_text(chat_id, accounts)
+    kb = _accounts_kb(chat_id, accounts)
+    if edit_message_id is not None:
+        try:
+            await bot.edit_message_text(text, chat_id=chat_id, message_id=edit_message_id, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            return
+        except Exception:
+            pass
+    await bot.send_message(chat_id, text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+@dp.callback_query(F.data.startswith("a|"))
+async def cb_accounts(cb: CallbackQuery) -> None:
+    if not await guard(cb):
+        return
+    _, cmd, name = cb.data.split("|", 2)
+    from server import list_accounts as _la
+    accounts = _la()
+
+    if cmd == "switch":
+        if name not in accounts:
+            await cb.answer(f"Нет такого: {name}", show_alert=True)
+            return
+        ACTIVE_ACCOUNT[cb.message.chat.id] = name
+        await cb.answer(f"→ {name}")
+        try:
+            data = await _fetch_quota(name)
+            QUOTA_CACHE[name] = (data, asyncio.get_event_loop().time())
+        except Exception as exc:
+            log.warning("quota fetch failed for %s: %s", name, exc)
+        await _send_accounts_panel(cb.bot, cb.message.chat.id, edit_message_id=cb.message.message_id)
+        return
+
+    if cmd == "refresh":
+        target = name if name in accounts else account_for(cb.message.chat.id)
+        await cb.answer(f"↻ {target}")
+        try:
+            data = await _fetch_quota(target)
+            QUOTA_CACHE[target] = (data, asyncio.get_event_loop().time())
+        except Exception as exc:
+            await cb.bot.send_message(cb.message.chat.id, f"quota failed ({target}): <code>{str(exc)[:300]}</code>", parse_mode=ParseMode.HTML)
+        await _send_accounts_panel(cb.bot, cb.message.chat.id, edit_message_id=cb.message.message_id)
+        return
+
+    if cmd == "refreshall":
+        await cb.answer("Опрашиваю все аккаунты…")
+        for acc in accounts:
+            try:
+                data = await _fetch_quota(acc)
+                QUOTA_CACHE[acc] = (data, asyncio.get_event_loop().time())
+            except Exception as exc:
+                log.warning("quota fetch failed for %s: %s", acc, exc)
+        await _send_accounts_panel(cb.bot, cb.message.chat.id, edit_message_id=cb.message.message_id)
+        return
+
+    await cb.answer(f"unknown a-cmd: {cmd}", show_alert=True)
 
 
 @dp.message(F.text == BTN_NEW)
@@ -443,13 +601,7 @@ async def btn_current(msg: Message) -> None:
 async def btn_accounts(msg: Message) -> None:
     if not await guard(msg):
         return
-    from server import list_accounts as _la
-    accs = _la()
-    await msg.answer(
-        f"Cookie-аккаунты: {', '.join(accs) if accs else '(none)'}\n"
-        f"Активный (env <code>GROK_APPROVAL_ACCOUNT</code>): <code>{DEFAULT_ACCOUNT}</code>",
-        parse_mode=ParseMode.HTML,
-    )
+    await _send_accounts_panel(msg.bot, msg.chat.id)
 
 
 @dp.message(Command("list"))
@@ -525,10 +677,11 @@ async def _plan_series_flow(msg: Message, topic: str) -> None:
         f"🧠 Планирую: <i>{topic[:200]}</i>\nGrok думает 30-90 сек…",
         parse_mode=ParseMode.HTML,
     )
+    acc = account_for(msg.chat.id)
     try:
-        cookies = load_cookie_file(DEFAULT_ACCOUNT)
+        cookies = load_cookie_file(acc)
     except Exception as exc:
-        await msg.answer(f"cookie file not found: {exc}")
+        await msg.answer(f"cookie file not found ({acc}): {exc}")
         return
     try:
         state = await plan_series(cookies, topic)
@@ -763,7 +916,7 @@ async def _do_regen(cb: CallbackQuery, sid: str, ep: int, sn: int) -> None:
             f"\n\nStyle: {style or 'cinematic'}"
             f"\n\nExisting prompt:\n{old}"
         )
-        cookies = load_cookie_file(DEFAULT_ACCOUNT)
+        cookies = load_cookie_file(account_for(cb.message.chat.id))
         try:
             new_text, _cid, _ = await grok_chat(cookies, instruction)
         except Exception:
@@ -840,7 +993,7 @@ async def _do_agent_video(bot: Bot, chat_id: int, sid: str, ep: int, sn: int) ->
         if not prompt:
             await bot.send_message(chat_id, f"E{ep}·S{sn}: пустой prompt")
             return
-        cookies = load_cookie_file(DEFAULT_ACCOUNT)
+        cookies = load_cookie_file(account_for(chat_id))
         aspect = scene.get("aspect_ratio") or "2:3"
         duration = int(scene.get("duration") or (state.get("settings") or {}).get("duration") or 6)
         agent_prompt = (
