@@ -1,20 +1,17 @@
 """Telegram approval bot for grok-cookie-mcp.
 
-Runs as a separate process alongside the MCP server. Talks to Grok through the
-same helper functions in ``server.py`` (no duplicated cookie/CDP logic).
+Owner-only aiogram bot that drives Grok via the same helpers as server.py.
 
-Flow (single owner, restricted by chat id):
+UX:
+    - persistent bottom menu (ReplyKeyboardMarkup)
+    - series header card with bulk buttons (approve-all / render-approved)
+    - wizard-style scene navigation (⬅ / ✅ / ➡)
+    - one video button that calls Grok Agent mode (video comes back voiced)
 
-    /series <topic>                   plan a series (Grok call, may take ~1 min)
-    /list                             show series files on disk
-    /open <id>                        pick a saved series
-    /show <id>                        print status
-    (inline buttons per scene)        approve / regenerate / edit
-    approve  -> generate_video + post to Telegram
-    regen    -> plan_series-like reroll of that single scene prompt
-    edit     -> ForceReply -> new prompt goes into the scene
-
-Persistence keeps its home in ``series/<id>.json``. The bot only wraps that state.
+Callback data schema (pipe-separated, keep sid last-ish for length safety):
+    m|<cmd>                     top-level menu buttons
+    s|<cmd>|<sid>               series-level buttons
+    w|<cmd>|<sid>|<ep>|<sn>     wizard scene actions
 """
 from __future__ import annotations
 
@@ -35,8 +32,9 @@ from aiogram.types import (
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
-    ReplyKeyboardRemove,
+    ReplyKeyboardMarkup,
 )
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -44,10 +42,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 from server import (  # noqa: E402
     OUTPUT_DIR,
     SERIES_DIR,
-    build_plan_prompt,
+    collect_grok_text,
+    collect_media_urls,
     create_and_wait_media,
+    deep_values,
     download_asset,
+    extract_video_ids,
     find_scene,
+    get_media_post,
     grok_chat,
     grok_chat_via_ui,
     guess_extension,
@@ -56,8 +58,9 @@ from server import (  # noqa: E402
     load_series,
     plan_series,
     save_series,
+    send_agent_prompt,
+    start_agent_conversation,
     start_video_generation,
-    extract_video_ids,
     video_payload,
     wait_for_video_url,
     _now_iso,
@@ -65,13 +68,8 @@ from server import (  # noqa: E402
 
 log = logging.getLogger("grok-approval-bot")
 
-BOT_TOKEN = os.environ.get("GROK_TG_BOT_TOKEN")
-OWNER_CHAT_ID = os.environ.get("GROK_TG_CHAT_ID")
-DEFAULT_ACCOUNT = os.environ.get("GROK_APPROVAL_ACCOUNT", "1")
-
 
 def _read_env_file() -> None:
-    """Same .env loader as server.py, in case bot is started without pre-loaded env."""
     env_path = Path(__file__).with_name(".env")
     if not env_path.exists():
         return
@@ -84,21 +82,25 @@ def _read_env_file() -> None:
 
 
 _read_env_file()
-BOT_TOKEN = BOT_TOKEN or os.environ.get("GROK_TG_BOT_TOKEN")
-OWNER_CHAT_ID = OWNER_CHAT_ID or os.environ.get("GROK_TG_CHAT_ID")
+BOT_TOKEN = os.environ.get("GROK_TG_BOT_TOKEN")
+OWNER_CHAT_ID = os.environ.get("GROK_TG_CHAT_ID")
+DEFAULT_ACCOUNT = os.environ.get("GROK_APPROVAL_ACCOUNT", "1")
 
 
 # ---------------------------------------------------------------------------
 # state
 # ---------------------------------------------------------------------------
 
-# per-owner "current series" pointer. FSM would be overkill for a one-person bot.
+# per-chat pointer to the currently open series
 CURRENT_SERIES: dict[int, str] = {}
 
-# in-flight per-scene tasks so we can prevent double-clicks and cancel edits
+# per-chat wizard cursor: chat -> (series_id, ep, sn)
+WIZARD_CURSOR: dict[int, tuple[str, int, int]] = {}
+
+# in-flight per-scene tasks (regen / video), prevent double-clicks
 IN_FLIGHT: dict[str, asyncio.Task[Any]] = {}
 
-# per-chat pending edit target: {chat_id: (series_id, ep, scene)}
+# per-chat pending edit target: {chat_id: (series_id, ep, sn)}
 PENDING_EDIT: dict[int, tuple[str, int, int]] = {}
 
 
@@ -119,87 +121,243 @@ def is_owner(chat_id: int) -> bool:
         return False
 
 
-async def guard(msg: Message | CallbackQuery) -> bool:
-    chat_id = msg.chat.id if isinstance(msg, Message) else (msg.message.chat.id if msg.message else 0)
-    if not is_owner(chat_id):
-        if isinstance(msg, Message):
-            await msg.answer("Not authorized.")
-        else:
-            await msg.answer("Not authorized.", show_alert=True)
-        return False
-    return True
+async def guard(evt: Message | CallbackQuery) -> bool:
+    chat_id = evt.chat.id if isinstance(evt, Message) else (evt.message.chat.id if evt.message else 0)
+    if is_owner(chat_id):
+        return True
+    if isinstance(evt, Message):
+        await evt.answer("Not authorized.")
+    else:
+        await evt.answer("Not authorized.", show_alert=True)
+    return False
 
 
 # ---------------------------------------------------------------------------
-# rendering helpers
+# keyboards
 # ---------------------------------------------------------------------------
 
-def _scene_status(scene: dict[str, Any]) -> str:
-    st = scene.get("status", "planned")
-    icons = {
+BTN_NEW = "🎬 Новый сериал"
+BTN_LIST = "📋 Мои сериалы"
+BTN_CURRENT = "🔄 Открыть текущий"
+BTN_ACCOUNTS = "⚙️ Аккаунты"
+BTN_HELP = "❓ Помощь"
+
+MENU_KB = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=BTN_NEW), KeyboardButton(text=BTN_LIST)],
+        [KeyboardButton(text=BTN_CURRENT), KeyboardButton(text=BTN_ACCOUNTS)],
+        [KeyboardButton(text=BTN_HELP)],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+
+def series_header_kb(state: dict[str, Any]) -> InlineKeyboardMarkup:
+    sid = state["id"]
+    rows: list[list[InlineKeyboardButton]] = []
+    rows.append([
+        InlineKeyboardButton(text="▶️ Пройти по сценам", callback_data=f"s|wiz|{sid}"),
+    ])
+    rows.append([
+        InlineKeyboardButton(text="✅ Одобрить все", callback_data=f"s|appall|{sid}"),
+        InlineKeyboardButton(text="🎬 Рендер одобренных", callback_data=f"s|renderall|{sid}"),
+    ])
+    rows.append([
+        InlineKeyboardButton(text="🔄 Обновить", callback_data=f"s|refresh|{sid}"),
+        InlineKeyboardButton(text="🗑 Удалить", callback_data=f"s|del|{sid}"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def wizard_kb(state: dict[str, Any], ep: int, sn: int) -> InlineKeyboardMarkup:
+    sid = state["id"]
+    scene = find_scene(state, ep, sn)
+    status = scene.get("status", "planned")
+
+    prev_ep, prev_sn = neighbor(state, ep, sn, -1)
+    next_ep, next_sn = neighbor(state, ep, sn, +1)
+
+    nav_row: list[InlineKeyboardButton] = []
+    if prev_ep is not None:
+        nav_row.append(InlineKeyboardButton(text="⬅️", callback_data=f"w|prev|{sid}|{ep}|{sn}"))
+    nav_row.append(InlineKeyboardButton(text=f"{ep}·{sn}", callback_data=f"w|noop|{sid}|{ep}|{sn}"))
+    if next_ep is not None:
+        nav_row.append(InlineKeyboardButton(text="➡️", callback_data=f"w|next|{sid}|{ep}|{sn}"))
+
+    rows: list[list[InlineKeyboardButton]] = [nav_row]
+
+    if status == "planned":
+        rows.append([
+            InlineKeyboardButton(text="✅ Одобрить", callback_data=f"w|appr|{sid}|{ep}|{sn}"),
+            InlineKeyboardButton(text="♻️ Регенерировать", callback_data=f"w|regen|{sid}|{ep}|{sn}"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="✏️ Правки", callback_data=f"w|edit|{sid}|{ep}|{sn}"),
+            InlineKeyboardButton(text="🎬 Видео (Agent+voice)", callback_data=f"w|video|{sid}|{ep}|{sn}"),
+        ])
+    elif status == "approved":
+        rows.append([
+            InlineKeyboardButton(text="🎬 Видео (Agent+voice)", callback_data=f"w|video|{sid}|{ep}|{sn}"),
+            InlineKeyboardButton(text="↩️ Снять одобрение", callback_data=f"w|unappr|{sid}|{ep}|{sn}"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="✏️ Правки", callback_data=f"w|edit|{sid}|{ep}|{sn}"),
+        ])
+    elif status == "video_ready":
+        rows.append([
+            InlineKeyboardButton(text="🔁 Пересобрать видео", callback_data=f"w|video|{sid}|{ep}|{sn}"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="✏️ Правки", callback_data=f"w|edit|{sid}|{ep}|{sn}"),
+            InlineKeyboardButton(text="↩️ В planned", callback_data=f"w|unappr|{sid}|{ep}|{sn}"),
+        ])
+    elif status in {"regenerating", "video_error"}:
+        rows.append([
+            InlineKeyboardButton(text="♻️ Регенерировать", callback_data=f"w|regen|{sid}|{ep}|{sn}"),
+            InlineKeyboardButton(text="🎬 Видео", callback_data=f"w|video|{sid}|{ep}|{sn}"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="✏️ Правки", callback_data=f"w|edit|{sid}|{ep}|{sn}"),
+        ])
+
+    rows.append([
+        InlineKeyboardButton(text="📄 К сериалу", callback_data=f"s|refresh|{sid}"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ---------------------------------------------------------------------------
+# helpers over series state
+# ---------------------------------------------------------------------------
+
+def all_scenes(state: dict[str, Any]) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    for episode in state.get("episodes", []):
+        ep = int(episode.get("episode_number", 0))
+        for scene in episode.get("scenes", []):
+            out.append((ep, int(scene.get("scene_number", 0))))
+    return out
+
+
+def neighbor(state: dict[str, Any], ep: int, sn: int, delta: int) -> tuple[int | None, int | None]:
+    scenes = all_scenes(state)
+    try:
+        idx = scenes.index((ep, sn))
+    except ValueError:
+        return None, None
+    j = idx + delta
+    if 0 <= j < len(scenes):
+        return scenes[j]
+    return None, None
+
+
+def scene_status_icon(status: str) -> str:
+    return {
         "planned": "⏳",
         "approved": "✅",
         "regenerating": "♻️",
         "video_ready": "🎬",
         "video_error": "⚠️",
-    }
-    return icons.get(st, "•")
+    }.get(status, "•")
 
 
-def format_scene(state: dict[str, Any], ep: int, sn: int) -> str:
-    scene = find_scene(state, ep, sn)
+def progress_line(state: dict[str, Any]) -> str:
+    total = len(all_scenes(state))
+    approved = 0
+    videos = 0
+    for episode in state.get("episodes", []):
+        for scene in episode.get("scenes", []):
+            st = scene.get("status", "planned")
+            if st in {"approved", "video_ready"}:
+                approved += 1
+            if st == "video_ready":
+                videos += 1
+    return f"✅ {approved}/{total}   🎬 {videos}/{total}"
+
+
+def format_series_header(state: dict[str, Any]) -> str:
     lines = [
-        f"<b>{state.get('title') or state.get('topic')}</b>",
-        f"E{ep} · S{sn} · {_scene_status(scene)} {scene.get('status', 'planned')}",
+        f"<b>{state.get('title') or state.get('topic') or 'Untitled'}</b>",
+        f"<code>{state['id']}</code>",
+    ]
+    if state.get("logline"):
+        lines.append(f"<i>{state['logline']}</i>")
+    lines.append(f"\n{progress_line(state)}")
+    if state.get("plan_parse_error"):
+        lines.append(f"⚠️ parse: <code>{str(state['plan_parse_error'])[:120]}</code>")
+    scenes = all_scenes(state)
+    if scenes:
+        lines.append("")
+        for episode in state.get("episodes", []):
+            ep = int(episode.get("episode_number", 0))
+            title = episode.get("title") or ""
+            lines.append(f"<b>E{ep}</b> {title}")
+            for scene in episode.get("scenes", []):
+                sn = int(scene.get("scene_number", 0))
+                st = scene.get("status", "planned")
+                icon = scene_status_icon(st)
+                desc = (scene.get("description") or "").strip()
+                lines.append(f"  {icon} S{sn}. {desc[:100]}")
+    return "\n".join(lines)
+
+
+def format_wizard(state: dict[str, Any], ep: int, sn: int) -> str:
+    scenes = all_scenes(state)
+    idx = scenes.index((ep, sn)) + 1 if (ep, sn) in scenes else 0
+    scene = find_scene(state, ep, sn)
+    st = scene.get("status", "planned")
+    lines = [
+        f"<b>{state.get('title') or state.get('topic')}</b>  ({idx}/{len(scenes)})",
+        f"E{ep} · S{sn} · {scene_status_icon(st)} {st}",
         "",
         f"<i>{(scene.get('description') or '')[:250]}</i>",
         "",
         f"<code>{(scene.get('prompt') or '')[:900]}</code>",
     ]
-    if scene.get("post_id"):
-        lines.append(f"post_id: <code>{scene['post_id']}</code>")
     if scene.get("video_url"):
-        lines.append(f"video: {scene['video_url']}")
+        lines.append("")
+        lines.append(f"🎬 <code>{scene.get('video_post_id', '')}</code>")
     return "\n".join(lines)
 
 
-def scene_kb(series_id: str, ep: int, sn: int, status: str) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    if status in {"planned", "regenerating", "video_error"}:
-        rows.append([
-            InlineKeyboardButton(text="✅ Одобрить", callback_data=f"appr|{series_id}|{ep}|{sn}"),
-            InlineKeyboardButton(text="♻️ Регенерировать", callback_data=f"regen|{series_id}|{ep}|{sn}"),
-        ])
-        rows.append([
-            InlineKeyboardButton(text="✏️ Правки", callback_data=f"edit|{series_id}|{ep}|{sn}"),
-        ])
-    elif status == "approved":
-        rows.append([
-            InlineKeyboardButton(text="🎬 Сгенерировать видео", callback_data=f"video|{series_id}|{ep}|{sn}"),
-            InlineKeyboardButton(text="↩️ Отменить одобрение", callback_data=f"unappr|{series_id}|{ep}|{sn}"),
-        ])
-    elif status == "video_ready":
-        rows.append([
-            InlineKeyboardButton(text="🔁 Перегенерировать видео", callback_data=f"video|{series_id}|{ep}|{sn}"),
-        ])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+# ---------------------------------------------------------------------------
+# rendering
+# ---------------------------------------------------------------------------
+
+async def send_series_header(bot: Bot, chat_id: int, state: dict[str, Any], reply_to: int | None = None) -> None:
+    await bot.send_message(
+        chat_id,
+        format_series_header(state),
+        reply_markup=series_header_kb(state),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
 
 
-async def send_scene_card(
-    bot: Bot,
-    chat_id: int,
-    state: dict[str, Any],
-    ep: int,
-    sn: int,
-    preview_path: Path | None = None,
-) -> None:
-    scene = find_scene(state, ep, sn)
-    text = format_scene(state, ep, sn)
-    kb = scene_kb(state["id"], ep, sn, scene.get("status", "planned"))
-    if preview_path and preview_path.exists():
-        await bot.send_photo(chat_id, FSInputFile(preview_path), caption=text[:1024], reply_markup=kb, parse_mode=ParseMode.HTML)
-    else:
-        await bot.send_message(chat_id, text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+async def send_wizard(bot: Bot, chat_id: int, state: dict[str, Any], ep: int, sn: int) -> None:
+    WIZARD_CURSOR[chat_id] = (state["id"], ep, sn)
+    await bot.send_message(
+        chat_id,
+        format_wizard(state, ep, sn),
+        reply_markup=wizard_kb(state, ep, sn),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+async def edit_wizard(cb: CallbackQuery, state: dict[str, Any], ep: int, sn: int) -> None:
+    WIZARD_CURSOR[cb.message.chat.id] = (state["id"], ep, sn)
+    try:
+        await cb.message.edit_text(
+            format_wizard(state, ep, sn),
+            reply_markup=wizard_kb(state, ep, sn),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        # if the message is a photo/media, fall back to a fresh send
+        await send_wizard(cb.bot, cb.message.chat.id, state, ep, sn)
 
 
 # ---------------------------------------------------------------------------
@@ -215,37 +373,107 @@ async def cmd_start(msg: Message) -> None:
         return
     await msg.answer(
         "🎬 <b>Grok Farm — approval bot</b>\n\n"
-        "/series &lt;topic&gt; — spin up a plan\n"
-        "/list — series on disk\n"
-        "/open &lt;id&gt; — pick one\n"
-        "/show — preview current series scenes\n"
-        "/accounts — cookie files on disk\n",
+        "Внизу — постоянное меню. Или команды:\n"
+        "/series &lt;topic&gt; · /list · /open &lt;id&gt; · /show\n",
+        parse_mode=ParseMode.HTML,
+        reply_markup=MENU_KB,
+    )
+
+
+@dp.message(Command("menu"))
+async def cmd_menu(msg: Message) -> None:
+    if not await guard(msg):
+        return
+    await msg.answer("Меню:", reply_markup=MENU_KB)
+
+
+@dp.message(F.text == BTN_HELP)
+async def btn_help(msg: Message) -> None:
+    if not await guard(msg):
+        return
+    await msg.answer(
+        "🎬 <b>Как это работает:</b>\n\n"
+        "1) <b>Новый сериал</b> → Grok Agent пишет план: эпизоды, сцены, промпты.\n"
+        "2) На карточке сериала — <i>Пройти по сценам</i>: wizard-навигация ⬅/➡.\n"
+        "3) Для каждой сцены: ✅ Одобрить · ♻️ Регенерировать промпт · ✏️ Правки.\n"
+        "4) 🎬 <b>Видео (Agent+voice)</b> — рендер через агентский режим, приходит уже с озвучкой.\n"
+        "5) На карточке сериала: <i>Одобрить все</i> и <i>Рендер одобренных</i> — массовые действия.\n\n"
+        "Стейт живёт в <code>series/&lt;id&gt;.json</code>, видео — в <code>output/</code>.",
         parse_mode=ParseMode.HTML,
     )
 
 
-@dp.message(Command("accounts"))
-async def cmd_accounts(msg: Message) -> None:
+@dp.message(F.text == BTN_NEW)
+async def btn_new(msg: Message) -> None:
+    if not await guard(msg):
+        return
+    PENDING_EDIT[msg.chat.id] = ("__new__", 0, 0)
+    await msg.answer(
+        "🧠 Пришли тему нового сериала одним сообщением. Например:\n"
+        "<i>Yellow rubber duck world tour</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@dp.message(F.text == BTN_LIST)
+async def btn_list(msg: Message) -> None:
+    if not await guard(msg):
+        return
+    await _render_list(msg)
+
+
+@dp.message(F.text == BTN_CURRENT)
+async def btn_current(msg: Message) -> None:
+    if not await guard(msg):
+        return
+    sid = CURRENT_SERIES.get(msg.chat.id)
+    if not sid:
+        await msg.answer("Нет открытого сериала. Жми <b>📋 Мои сериалы</b>.", parse_mode=ParseMode.HTML)
+        return
+    try:
+        state = load_series(sid)
+    except FileNotFoundError:
+        CURRENT_SERIES.pop(msg.chat.id, None)
+        await msg.answer("Текущий сериал исчез с диска.")
+        return
+    await send_series_header(msg.bot, msg.chat.id, state)
+
+
+@dp.message(F.text == BTN_ACCOUNTS)
+async def btn_accounts(msg: Message) -> None:
     if not await guard(msg):
         return
     from server import list_accounts as _la
     accs = _la()
-    await msg.answer("Accounts: " + (", ".join(accs) if accs else "(none)"))
+    await msg.answer(
+        f"Cookie-аккаунты: {', '.join(accs) if accs else '(none)'}\n"
+        f"Активный (env <code>GROK_APPROVAL_ACCOUNT</code>): <code>{DEFAULT_ACCOUNT}</code>",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @dp.message(Command("list"))
 async def cmd_list(msg: Message) -> None:
     if not await guard(msg):
         return
+    await _render_list(msg)
+
+
+async def _render_list(msg: Message) -> None:
     items = list_series_files()
     if not items:
-        await msg.answer("No series yet. Use /series &lt;topic&gt;.", parse_mode=ParseMode.HTML)
+        await msg.answer("Пока пусто. Жми <b>🎬 Новый сериал</b>.", parse_mode=ParseMode.HTML, reply_markup=MENU_KB)
         return
-    lines = ["<b>Series on disk:</b>"]
+    rows: list[list[InlineKeyboardButton]] = []
     for it in items[-20:]:
-        lines.append(f"• <code>{it.get('id')}</code> — {it.get('topic')} ({it.get('scenes')} scenes)")
-    lines.append("\n<i>Use</i> /open &lt;id&gt;")
-    await msg.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+        sid = it.get("id") or Path(it.get("path", "")).stem
+        topic = (it.get("topic") or sid)[:32]
+        rows.append([InlineKeyboardButton(text=f"📄 {topic}", callback_data=f"s|open|{sid}")])
+    await msg.answer(
+        "<b>Твои сериалы:</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
 
 
 @dp.message(Command("open"))
@@ -256,14 +484,17 @@ async def cmd_open(msg: Message) -> None:
     if len(parts) < 2:
         await msg.answer("Usage: /open &lt;series_id&gt;", parse_mode=ParseMode.HTML)
         return
-    sid = parts[1].strip()
+    await _open_series(msg.bot, msg.chat.id, parts[1].strip())
+
+
+async def _open_series(bot: Bot, chat_id: int, sid: str) -> None:
     try:
         state = load_series(sid)
     except FileNotFoundError:
-        await msg.answer(f"No such series: <code>{sid}</code>", parse_mode=ParseMode.HTML)
+        await bot.send_message(chat_id, f"Нет сериала <code>{sid}</code>", parse_mode=ParseMode.HTML)
         return
-    CURRENT_SERIES[msg.chat.id] = state["id"]
-    await msg.answer(f"Opened <code>{state['id']}</code>. Use /show to see scenes.", parse_mode=ParseMode.HTML)
+    CURRENT_SERIES[chat_id] = state["id"]
+    await send_series_header(bot, chat_id, state)
 
 
 @dp.message(Command("show"))
@@ -273,22 +504,9 @@ async def cmd_show(msg: Message) -> None:
     parts = (msg.text or "").split(maxsplit=1)
     sid = parts[1].strip() if len(parts) > 1 else CURRENT_SERIES.get(msg.chat.id)
     if not sid:
-        await msg.answer("No current series. /open &lt;id&gt; or pass id: /show &lt;id&gt;", parse_mode=ParseMode.HTML)
+        await msg.answer("Нет активного. /open &lt;id&gt; или <b>📋 Мои сериалы</b>", parse_mode=ParseMode.HTML)
         return
-    try:
-        state = load_series(sid)
-    except FileNotFoundError:
-        await msg.answer(f"No such series: <code>{sid}</code>", parse_mode=ParseMode.HTML)
-        return
-    CURRENT_SERIES[msg.chat.id] = state["id"]
-    header = f"<b>{state.get('title') or state.get('topic')}</b>\n<code>{state['id']}</code>"
-    if state.get("logline"):
-        header += f"\n<i>{state['logline']}</i>"
-    await msg.answer(header, parse_mode=ParseMode.HTML)
-    for episode in state.get("episodes", []):
-        ep = int(episode["episode_number"])
-        for scene in episode.get("scenes", []):
-            await send_scene_card(msg.bot, msg.chat.id, state, ep, int(scene["scene_number"]))
+    await _open_series(msg.bot, msg.chat.id, sid)
 
 
 @dp.message(Command("series"))
@@ -299,8 +517,14 @@ async def cmd_series(msg: Message) -> None:
     if len(parts) < 2:
         await msg.answer("Usage: /series &lt;topic&gt;", parse_mode=ParseMode.HTML)
         return
-    topic = parts[1].strip()
-    await msg.answer(f"🧠 Planning series: <i>{topic[:200]}</i>\nGrok call in progress, this can take 30-90 s…", parse_mode=ParseMode.HTML)
+    await _plan_series_flow(msg, parts[1].strip())
+
+
+async def _plan_series_flow(msg: Message, topic: str) -> None:
+    await msg.answer(
+        f"🧠 Планирую: <i>{topic[:200]}</i>\nGrok думает 30-90 сек…",
+        parse_mode=ParseMode.HTML,
+    )
     try:
         cookies = load_cookie_file(DEFAULT_ACCOUNT)
     except Exception as exc:
@@ -313,245 +537,29 @@ async def cmd_series(msg: Message) -> None:
         await msg.answer(f"plan_series failed: <code>{str(exc)[:400]}</code>", parse_mode=ParseMode.HTML)
         return
     CURRENT_SERIES[msg.chat.id] = state["id"]
-    if state.get("plan_parse_error"):
-        await msg.answer(
-            f"⚠️ Plan parse warning: <code>{str(state['plan_parse_error'])[:400]}</code>\nRaw text kept in series/{state['id']}.json",
-            parse_mode=ParseMode.HTML,
-        )
-    header = f"<b>{state.get('title') or topic}</b>\n<code>{state['id']}</code>"
-    if state.get("logline"):
-        header += f"\n<i>{state['logline']}</i>"
-    await msg.answer(header, parse_mode=ParseMode.HTML)
-    if not state.get("episodes"):
-        await msg.answer("No episodes parsed. Check the raw text in series file and re-plan.")
-        return
-    for episode in state["episodes"]:
-        ep = int(episode["episode_number"])
-        for scene in episode.get("scenes", []):
-            await send_scene_card(msg.bot, msg.chat.id, state, ep, int(scene["scene_number"]))
+    await send_series_header(msg.bot, msg.chat.id, state)
 
 
 # ---------------------------------------------------------------------------
-# callback handlers
+# free-form text (routes: new-series topic input, edit-prompt input)
 # ---------------------------------------------------------------------------
 
-@dp.callback_query(F.data.startswith("appr|"))
-async def cb_approve(cb: CallbackQuery) -> None:
-    if not await guard(cb):
-        return
-    _, sid, ep, sn = cb.data.split("|")
-    state = load_series(sid)
-    scene = find_scene(state, int(ep), int(sn))
-    scene["status"] = "approved"
-    scene["approved_at"] = _now_iso()
-    state["updated_at"] = _now_iso()
-    save_series(state)
-    await cb.answer("Одобрено")
-    kb = scene_kb(sid, int(ep), int(sn), "approved")
-    try:
-        await cb.message.edit_reply_markup(reply_markup=kb)
-    except Exception:
-        pass
+MENU_TEXTS = {BTN_NEW, BTN_LIST, BTN_CURRENT, BTN_ACCOUNTS, BTN_HELP}
 
-
-@dp.callback_query(F.data.startswith("unappr|"))
-async def cb_unapprove(cb: CallbackQuery) -> None:
-    if not await guard(cb):
-        return
-    _, sid, ep, sn = cb.data.split("|")
-    state = load_series(sid)
-    scene = find_scene(state, int(ep), int(sn))
-    scene["status"] = "planned"
-    state["updated_at"] = _now_iso()
-    save_series(state)
-    await cb.answer("Возвращено в planned")
-    kb = scene_kb(sid, int(ep), int(sn), "planned")
-    try:
-        await cb.message.edit_reply_markup(reply_markup=kb)
-    except Exception:
-        pass
-
-
-@dp.callback_query(F.data.startswith("edit|"))
-async def cb_edit(cb: CallbackQuery) -> None:
-    if not await guard(cb):
-        return
-    _, sid, ep, sn = cb.data.split("|")
-    PENDING_EDIT[cb.message.chat.id] = (sid, int(ep), int(sn))
-    await cb.answer()
-    await cb.message.reply(
-        f"✏️ Пришли новый prompt для сцены E{ep}·S{sn}.\n<i>Один следующий текстовый месседж заменит prompt целиком.</i>",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-@dp.callback_query(F.data.startswith("regen|"))
-async def cb_regen(cb: CallbackQuery) -> None:
-    if not await guard(cb):
-        return
-    _, sid, ep, sn = cb.data.split("|")
-    key = scene_key(sid, int(ep), int(sn))
-    if key in IN_FLIGHT and not IN_FLIGHT[key].done():
-        await cb.answer("Уже пересобирается", show_alert=True)
-        return
-    await cb.answer("Пересобираю prompt…")
-    IN_FLIGHT[key] = asyncio.create_task(_do_regen(cb, sid, int(ep), int(sn)))
-
-
-async def _do_regen(cb: CallbackQuery, sid: str, ep: int, sn: int) -> None:
-    try:
-        state = load_series(sid)
-        scene = find_scene(state, ep, sn)
-        old = scene.get("prompt", "")
-        style = (state.get("settings") or {}).get("style") or (state.get("consistency") or {}).get("style") or ""
-        instruction = (
-            "Rewrite this single Grok Imagine scene prompt with a fresh interpretation. "
-            "Keep the same subject, aspect ratio and duration; vary the composition, lighting or motion. "
-            "Reply with ONLY the new prompt text — no JSON, no bullet points."
-            f"\n\nSubject/style constraint: {style or 'cinematic'}"
-            f"\n\nExisting prompt:\n{old}"
-        )
-        cookies = load_cookie_file(DEFAULT_ACCOUNT)
-        try:
-            new_text, _cid, _ = await grok_chat(cookies, instruction)
-        except Exception:
-            new_text, _cid, _ = await grok_chat_via_ui(cookies, instruction, mode="agent", timeout=180)
-        new_prompt = (new_text or "").strip()
-        # strip surrounding quotes if any
-        if new_prompt.startswith("```"):
-            new_prompt = re.sub(r"^```[a-zA-Z]*\n?|\n?```$", "", new_prompt).strip()
-        if not new_prompt:
-            await cb.message.reply("♻️ regen returned empty text, aborting")
-            return
-        scene["prompt"] = new_prompt
-        scene["status"] = "planned"
-        state["updated_at"] = _now_iso()
-        save_series(state)
-        await cb.message.reply(f"♻️ Новый prompt E{ep}·S{sn}:\n<code>{new_prompt[:900]}</code>", parse_mode=ParseMode.HTML)
-        await send_scene_card(cb.bot, cb.message.chat.id, state, ep, sn)
-    except Exception as exc:
-        log.exception("regen failed")
-        try:
-            await cb.message.reply(f"regen failed: <code>{str(exc)[:400]}</code>", parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
-
-
-@dp.callback_query(F.data.startswith("video|"))
-async def cb_video(cb: CallbackQuery) -> None:
-    if not await guard(cb):
-        return
-    _, sid, ep, sn = cb.data.split("|")
-    key = scene_key(sid, int(ep), int(sn))
-    if key in IN_FLIGHT and not IN_FLIGHT[key].done():
-        await cb.answer("Видео уже в работе", show_alert=True)
-        return
-    await cb.answer("Стартую видео (2-4 мин)…")
-    IN_FLIGHT[key] = asyncio.create_task(_do_video(cb, sid, int(ep), int(sn)))
-
-
-async def _do_video(cb: CallbackQuery, sid: str, ep: int, sn: int) -> None:
-    chat_id = cb.message.chat.id
-    try:
-        state = load_series(sid)
-        scene = find_scene(state, ep, sn)
-        prompt = scene.get("prompt")
-        if not prompt:
-            await cb.bot.send_message(chat_id, f"E{ep}·S{sn}: no prompt to render")
-            return
-        cookies = load_cookie_file(DEFAULT_ACCOUNT)
-
-        # 1. parent post (image) -- Grok needs it for video gen
-        status_msg = await cb.bot.send_message(chat_id, f"🖼️ E{ep}·S{sn}: seeding parent image…")
-        parent_post_id = scene.get("parent_post_id")
-        if not parent_post_id:
-            img = await create_and_wait_media(cookies, "MEDIA_POST_TYPE_IMAGE", prompt, timeout=180)
-            parent_post_id = img.get("post_id")
-            if not parent_post_id:
-                await status_msg.edit_text(f"E{ep}·S{sn}: no parent post id, aborting")
-                return
-            scene["parent_post_id"] = parent_post_id
-            save_series(state)
-
-        # 2. real video
-        await status_msg.edit_text(f"🎬 E{ep}·S{sn}: video gen started (parent {parent_post_id[:8]}…)")
-        vp = video_payload(
-            {
-                "prompt": prompt,
-                "aspect_ratio": scene.get("aspect_ratio") or "2:3",
-                "resolution": "480p",
-                "duration": int(scene.get("duration") or (state.get("settings") or {}).get("duration") or 6),
-            },
-            parent_post_id,
-        )
-        events = await start_video_generation(cookies, vp)
-        ids = extract_video_ids(events)
-        target = ids.get("videoPostId") or parent_post_id
-        result = await wait_for_video_url(cookies, target, timeout=360)
-        if result.get("status") != "ready":
-            scene["status"] = "video_error"
-            state["updated_at"] = _now_iso()
-            save_series(state)
-            await status_msg.edit_text(f"E{ep}·S{sn}: video not ready (status={result.get('status')})")
-            return
-
-        video_urls = result.get("video_urls") or []
-        if not video_urls:
-            scene["status"] = "video_error"
-            save_series(state)
-            await status_msg.edit_text(f"E{ep}·S{sn}: no video url returned")
-            return
-        url = video_urls[0]
-
-        # 3. download + upload
-        await status_msg.edit_text(f"⬇️ E{ep}·S{sn}: downloading video…")
-        OUTPUT_DIR.mkdir(exist_ok=True)
-        suffix = guess_extension(url, ".mp4")
-        dest = OUTPUT_DIR / f"{target}_scene_{ep}_{sn}{suffix}"
-        await download_asset(cookies, url, dest)
-        await status_msg.edit_text(f"📤 E{ep}·S{sn}: uploading to Telegram…")
-        caption = f"E{ep} · S{sn} — {state.get('title') or state.get('topic')}"
-        await cb.bot.send_video(chat_id, FSInputFile(dest), caption=caption[:1024])
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
-
-        scene["status"] = "video_ready"
-        scene["video_post_id"] = target
-        scene["video_url"] = url
-        scene["video_file"] = str(dest)
-        state["updated_at"] = _now_iso()
-        save_series(state)
-    except Exception as exc:
-        log.exception("video failed")
-        try:
-            state = load_series(sid)
-            scene = find_scene(state, ep, sn)
-            scene["status"] = "video_error"
-            scene["video_error"] = str(exc)[:500]
-            state["updated_at"] = _now_iso()
-            save_series(state)
-        except Exception:
-            pass
-        try:
-            await cb.bot.send_message(chat_id, f"video failed E{ep}·S{sn}: <code>{str(exc)[:400]}</code>", parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
-
-
-# ---------------------------------------------------------------------------
-# free-form text: only meaningful right after "✏️ Правки"
-# ---------------------------------------------------------------------------
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def on_text(msg: Message) -> None:
     if not await guard(msg):
         return
+    if (msg.text or "") in MENU_TEXTS:
+        return  # handled by dedicated F.text handlers above
     pending = PENDING_EDIT.pop(msg.chat.id, None)
     if not pending:
         return
     sid, ep, sn = pending
+    if sid == "__new__":
+        await _plan_series_flow(msg, (msg.text or "").strip())
+        return
     try:
         state = load_series(sid)
     except FileNotFoundError:
@@ -562,8 +570,381 @@ async def on_text(msg: Message) -> None:
     scene["status"] = "planned"
     state["updated_at"] = _now_iso()
     save_series(state)
-    await msg.reply(f"✏️ Prompt E{ep}·S{sn} updated.")
-    await send_scene_card(msg.bot, msg.chat.id, state, ep, sn)
+    await msg.reply(f"✏️ Prompt E{ep}·S{sn} обновлён.")
+    await send_wizard(msg.bot, msg.chat.id, state, ep, sn)
+
+
+# ---------------------------------------------------------------------------
+# series-level callbacks (s|<cmd>|<sid>)
+# ---------------------------------------------------------------------------
+
+@dp.callback_query(F.data.startswith("s|"))
+async def cb_series(cb: CallbackQuery) -> None:
+    if not await guard(cb):
+        return
+    _, cmd, sid = cb.data.split("|", 2)
+    try:
+        state = load_series(sid)
+    except FileNotFoundError:
+        await cb.answer("Сериал не найден", show_alert=True)
+        return
+
+    if cmd == "open":
+        await cb.answer()
+        CURRENT_SERIES[cb.message.chat.id] = state["id"]
+        await send_series_header(cb.bot, cb.message.chat.id, state)
+        return
+
+    if cmd == "refresh":
+        await cb.answer("↻")
+        try:
+            await cb.message.edit_text(
+                format_series_header(state),
+                reply_markup=series_header_kb(state),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            await send_series_header(cb.bot, cb.message.chat.id, state)
+        return
+
+    if cmd == "wiz":
+        scenes = all_scenes(state)
+        if not scenes:
+            await cb.answer("В сериале нет сцен", show_alert=True)
+            return
+        # start at first non-video-ready scene, else first
+        start = next((s for s in scenes if find_scene(state, *s).get("status") not in {"video_ready"}), scenes[0])
+        await cb.answer()
+        await send_wizard(cb.bot, cb.message.chat.id, state, *start)
+        return
+
+    if cmd == "appall":
+        touched = 0
+        for episode in state.get("episodes", []):
+            for scene in episode.get("scenes", []):
+                if scene.get("status") == "planned":
+                    scene["status"] = "approved"
+                    scene["approved_at"] = _now_iso()
+                    touched += 1
+        state["updated_at"] = _now_iso()
+        save_series(state)
+        await cb.answer(f"Одобрено: {touched}")
+        try:
+            await cb.message.edit_text(
+                format_series_header(state),
+                reply_markup=series_header_kb(state),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            pass
+        return
+
+    if cmd == "renderall":
+        await cb.answer("Ставлю в очередь…")
+        asyncio.create_task(_render_all_approved(cb.bot, cb.message.chat.id, state["id"]))
+        return
+
+    if cmd == "del":
+        path = Path(list_series_files()[0]["path"]).with_name(f"{state['id']}.json") if False else None
+        from server import series_path as _sp
+        try:
+            _sp(state["id"]).unlink(missing_ok=True)
+        except Exception as exc:
+            await cb.answer(f"delete failed: {exc}", show_alert=True)
+            return
+        CURRENT_SERIES.pop(cb.message.chat.id, None)
+        await cb.answer("Удалено")
+        try:
+            await cb.message.edit_text(f"🗑 Удалён <code>{state['id']}</code>", parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        return
+
+    await cb.answer(f"unknown cmd: {cmd}", show_alert=True)
+
+
+# ---------------------------------------------------------------------------
+# wizard-level callbacks (w|<cmd>|<sid>|<ep>|<sn>)
+# ---------------------------------------------------------------------------
+
+@dp.callback_query(F.data.startswith("w|"))
+async def cb_wizard(cb: CallbackQuery) -> None:
+    if not await guard(cb):
+        return
+    _, cmd, sid, ep_s, sn_s = cb.data.split("|", 4)
+    ep, sn = int(ep_s), int(sn_s)
+    try:
+        state = load_series(sid)
+    except FileNotFoundError:
+        await cb.answer("Сериал не найден", show_alert=True)
+        return
+
+    if cmd == "noop":
+        await cb.answer()
+        return
+
+    if cmd in {"prev", "next"}:
+        target = neighbor(state, ep, sn, -1 if cmd == "prev" else +1)
+        if target == (None, None):
+            await cb.answer("Край", show_alert=False)
+            return
+        await cb.answer()
+        await edit_wizard(cb, state, *target)
+        return
+
+    if cmd == "appr":
+        scene = find_scene(state, ep, sn)
+        scene["status"] = "approved"
+        scene["approved_at"] = _now_iso()
+        state["updated_at"] = _now_iso()
+        save_series(state)
+        await cb.answer("Одобрено ✅")
+        nxt = neighbor(state, ep, sn, +1)
+        if nxt != (None, None):
+            await edit_wizard(cb, state, *nxt)
+        else:
+            await edit_wizard(cb, state, ep, sn)
+        return
+
+    if cmd == "unappr":
+        scene = find_scene(state, ep, sn)
+        scene["status"] = "planned"
+        state["updated_at"] = _now_iso()
+        save_series(state)
+        await cb.answer("Снято одобрение")
+        await edit_wizard(cb, state, ep, sn)
+        return
+
+    if cmd == "edit":
+        PENDING_EDIT[cb.message.chat.id] = (sid, ep, sn)
+        await cb.answer()
+        await cb.message.reply(
+            f"✏️ Пришли новый prompt для E{ep}·S{sn} одним сообщением.",
+        )
+        return
+
+    if cmd == "regen":
+        key = scene_key(sid, ep, sn)
+        if key in IN_FLIGHT and not IN_FLIGHT[key].done():
+            await cb.answer("Уже пересобирается", show_alert=True)
+            return
+        await cb.answer("♻️ Grok думает…")
+        IN_FLIGHT[key] = asyncio.create_task(_do_regen(cb, sid, ep, sn))
+        return
+
+    if cmd == "video":
+        key = scene_key(sid, ep, sn)
+        if key in IN_FLIGHT and not IN_FLIGHT[key].done():
+            await cb.answer("Видео уже в работе", show_alert=True)
+            return
+        await cb.answer("🎬 Agent запускает видео с озвучкой…")
+        IN_FLIGHT[key] = asyncio.create_task(_do_agent_video(cb.bot, cb.message.chat.id, sid, ep, sn))
+        return
+
+    await cb.answer(f"unknown wcmd: {cmd}", show_alert=True)
+
+
+# ---------------------------------------------------------------------------
+# actions
+# ---------------------------------------------------------------------------
+
+async def _do_regen(cb: CallbackQuery, sid: str, ep: int, sn: int) -> None:
+    try:
+        state = load_series(sid)
+        scene = find_scene(state, ep, sn)
+        old = scene.get("prompt", "")
+        style = (state.get("settings") or {}).get("style") or (state.get("consistency") or {}).get("style") or ""
+        instruction = (
+            "Rewrite this single Grok Imagine scene prompt with a fresh interpretation. "
+            "Keep the same subject and aspect ratio; vary the composition, lighting or motion. "
+            "Reply with ONLY the new prompt text — no JSON, no bullets, no preamble."
+            f"\n\nStyle: {style or 'cinematic'}"
+            f"\n\nExisting prompt:\n{old}"
+        )
+        cookies = load_cookie_file(DEFAULT_ACCOUNT)
+        try:
+            new_text, _cid, _ = await grok_chat(cookies, instruction)
+        except Exception:
+            new_text, _cid, _ = await grok_chat_via_ui(cookies, instruction, mode="agent", timeout=180)
+        new_prompt = (new_text or "").strip()
+        if new_prompt.startswith("```"):
+            new_prompt = re.sub(r"^```[a-zA-Z]*\n?|\n?```$", "", new_prompt).strip()
+        if not new_prompt:
+            await cb.bot.send_message(cb.message.chat.id, "♻️ regen: пустой ответ, ничего не меняю")
+            return
+        scene["prompt"] = new_prompt
+        scene["status"] = "planned"
+        state["updated_at"] = _now_iso()
+        save_series(state)
+        await edit_wizard(cb, state, ep, sn)
+    except Exception as exc:
+        log.exception("regen failed")
+        try:
+            await cb.bot.send_message(cb.message.chat.id, f"regen failed: <code>{str(exc)[:400]}</code>", parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+
+
+def _extract_agent_post_ids(events: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """Walk Agent event stream, collect any post ids referenced.
+
+    Grok Agent internally spawns media posts (image+video) as it works. Their ids
+    show up as ``postId``, ``videoPostId``, ``parentPostId`` — grab all of them so
+    we can poll each for a ready video URL.
+    """
+    video_ids: list[str] = []
+    other_ids: list[str] = []
+    for event in events:
+        for node in deep_values(event):
+            for key in ("videoPostId",):
+                v = node.get(key)
+                if isinstance(v, str) and v and v not in video_ids:
+                    video_ids.append(v)
+            for key in ("postId", "parentPostId", "id"):
+                v = node.get(key)
+                if isinstance(v, str) and re.fullmatch(r"[a-f0-9-]{20,}", v) and v not in other_ids:
+                    other_ids.append(v)
+    return {"video": video_ids, "other": other_ids}
+
+
+async def _wait_any_video(cookies: dict[str, str], post_ids: list[str], timeout: int) -> tuple[str | None, dict[str, Any]]:
+    """Poll a list of candidate post ids until any of them has a video URL."""
+    deadline_ticks = max(timeout // 5, 1)
+    last_by_post: dict[str, dict[str, Any]] = {}
+    for _ in range(deadline_ticks):
+        for pid in post_ids:
+            latest = await get_media_post(cookies, pid) or {}
+            if latest:
+                last_by_post[pid] = latest
+            urls = collect_media_urls(latest) if latest else {"video_urls": [], "image_urls": [], "audio_urls": []}
+            if urls["video_urls"]:
+                return pid, {"status": "ready", "post": latest, **urls}
+        await asyncio.sleep(5)
+    # timeout — return the freshest snapshot we saw
+    if last_by_post:
+        pid, latest = next(iter(last_by_post.items()))
+        urls = collect_media_urls(latest)
+        return pid, {"status": "timeout", "post": latest, **urls}
+    return None, {"status": "timeout"}
+
+
+async def _do_agent_video(bot: Bot, chat_id: int, sid: str, ep: int, sn: int) -> None:
+    """Send scene prompt to Grok Agent, wait for the resulting voiced video, deliver."""
+    status_msg: Message | None = None
+    try:
+        state = load_series(sid)
+        scene = find_scene(state, ep, sn)
+        prompt = (scene.get("prompt") or "").strip()
+        if not prompt:
+            await bot.send_message(chat_id, f"E{ep}·S{sn}: пустой prompt")
+            return
+        cookies = load_cookie_file(DEFAULT_ACCOUNT)
+        aspect = scene.get("aspect_ratio") or "2:3"
+        duration = int(scene.get("duration") or (state.get("settings") or {}).get("duration") or 6)
+        agent_prompt = (
+            f"Turn this scene into a short {duration}s cinematic video with built-in voice-over narration. "
+            f"Aspect ratio {aspect}. Keep the same subject and style across cuts.\n\nScene:\n{prompt}"
+        )
+        status_msg = await bot.send_message(chat_id, f"🎬 E{ep}·S{sn}: Agent запущен, ждём стрим…")
+        cid, events = await start_agent_conversation(cookies, None, agent_prompt)
+        pids = _extract_agent_post_ids(events)
+        candidates = pids["video"] + pids["other"]
+        if not candidates:
+            # last-resort: give agent a nudge and re-read
+            try:
+                await send_agent_prompt(cookies, cid or "", "Please finalize the video and return the media post.")
+            except Exception:
+                pass
+        candidates = list(dict.fromkeys(candidates))  # dedupe, preserve order
+        if not candidates:
+            await status_msg.edit_text(f"E{ep}·S{sn}: Agent не вернул postId. Может, модерация. Смотри series/{sid}.json")
+            return
+
+        await status_msg.edit_text(f"⏳ E{ep}·S{sn}: жду видео по {len(candidates)} постам…")
+        winner_pid, result = await _wait_any_video(cookies, candidates, timeout=420)
+        if result.get("status") != "ready":
+            scene["status"] = "video_error"
+            scene["agent_conversation_id"] = cid
+            scene["agent_candidates"] = candidates
+            state["updated_at"] = _now_iso()
+            save_series(state)
+            await status_msg.edit_text(f"E{ep}·S{sn}: Agent видео не готово (status={result.get('status')})")
+            return
+
+        video_urls = result.get("video_urls") or []
+        if not video_urls:
+            scene["status"] = "video_error"
+            save_series(state)
+            await status_msg.edit_text(f"E{ep}·S{sn}: нет video_url")
+            return
+
+        url = video_urls[0]
+        await status_msg.edit_text(f"⬇️ E{ep}·S{sn}: качаю…")
+        OUTPUT_DIR.mkdir(exist_ok=True)
+        suffix = guess_extension(url, ".mp4")
+        dest = OUTPUT_DIR / f"{winner_pid}_scene_{ep}_{sn}{suffix}"
+        await download_asset(cookies, url, dest)
+        await status_msg.edit_text(f"📤 E{ep}·S{sn}: отправляю в Telegram…")
+        caption = f"E{ep} · S{sn} — {state.get('title') or state.get('topic')}"
+        await bot.send_video(chat_id, FSInputFile(dest), caption=caption[:1024])
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+        scene["status"] = "video_ready"
+        scene["agent_conversation_id"] = cid
+        scene["video_post_id"] = winner_pid
+        scene["video_url"] = url
+        scene["video_file"] = str(dest)
+        state["updated_at"] = _now_iso()
+        save_series(state)
+    except Exception as exc:
+        log.exception("agent video failed")
+        try:
+            state = load_series(sid)
+            scene = find_scene(state, ep, sn)
+            scene["status"] = "video_error"
+            scene["video_error"] = str(exc)[:500]
+            state["updated_at"] = _now_iso()
+            save_series(state)
+        except Exception:
+            pass
+        try:
+            if status_msg is not None:
+                await status_msg.edit_text(f"video failed E{ep}·S{sn}: <code>{str(exc)[:400]}</code>", parse_mode=ParseMode.HTML)
+            else:
+                await bot.send_message(chat_id, f"video failed E{ep}·S{sn}: <code>{str(exc)[:400]}</code>", parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+
+
+async def _render_all_approved(bot: Bot, chat_id: int, sid: str) -> None:
+    try:
+        state = load_series(sid)
+    except FileNotFoundError:
+        await bot.send_message(chat_id, f"No such series: <code>{sid}</code>", parse_mode=ParseMode.HTML)
+        return
+    todo: list[tuple[int, int]] = []
+    for episode in state.get("episodes", []):
+        ep = int(episode.get("episode_number", 0))
+        for scene in episode.get("scenes", []):
+            if scene.get("status") == "approved":
+                todo.append((ep, int(scene.get("scene_number", 0))))
+    if not todo:
+        await bot.send_message(chat_id, "Нет approved-сцен для рендера.")
+        return
+    await bot.send_message(chat_id, f"🎬 Рендер {len(todo)} сцен последовательно (Agent+voice)…")
+    for ep, sn in todo:
+        key = scene_key(sid, ep, sn)
+        IN_FLIGHT[key] = asyncio.create_task(_do_agent_video(bot, chat_id, sid, ep, sn))
+        try:
+            await IN_FLIGHT[key]
+        except Exception:
+            pass
+    await bot.send_message(chat_id, "✅ Рендер завершён.")
 
 
 # ---------------------------------------------------------------------------
