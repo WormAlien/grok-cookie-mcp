@@ -144,6 +144,48 @@ Ops:
 - Every generation tool takes optional `send_to_telegram=true` to auto-push
   the finished media to the configured chat.
 
+## Local file uploads (reversed 2026-07-07)
+
+Grok's Imagine UI uploads dragged files via a multipart endpoint that is not on
+the `/rest/` prefix. Reversed via `scripts/sniff_upload.py` (CDP network taps).
+
+- `POST https://grok.com/http/upload-file-v2/direct`
+  - `Content-Type: multipart/form-data`
+  - single field `file` = the raw bytes with a filename
+  - reply:
+    ```json
+    {
+      "uploadId": "...",
+      "fileMetadata": {
+        "fileMetadataId": "02fa076a-...",
+        "fileMimeType": "image/jpeg",
+        "fileName": "...",
+        "fileUri": "users/<userId>/<fileMetadataId>/content",
+        "fileSource": "SELF_UPLOAD_..."
+      }
+    }
+    ```
+  - Public-ish asset URL:
+    `https://assets.grok.com/users/<userId>/<fileMetadataId>/content?cache=1`
+
+Attaching an uploaded file to a chat message is done **inline in the text**,
+not through `imageAttachments` / `fileAttachments` (both stay empty). The UI
+sends the message with an `[references:@<id1>,@<id2>] ` prefix, e.g.:
+
+```
+"message": "[references:@02fa076a-...,@eff33f41-...] Animate the first image..."
+```
+
+Selecting an already-generated post from the "Recents" tray uses the same
+`@id` syntax, but the id is a post/asset id from the user's own history.
+
+Server-side, this is now exposed as:
+- `browser_upload_file(path, cookies)` — POSTs multipart via CDP page context
+- `references_prefix([id1,id2])` — builds the `[references:@id,@id] ` prefix
+- `start_agent_conversation(..., reference_ids=[...])` and
+  `send_agent_prompt(..., reference_ids=[...])` — prepend the prefix
+- MCP tool `upload_local_file` for external callers
+
 ## Grok endpoints touched
 
 Live REST endpoints (all POST unless noted):

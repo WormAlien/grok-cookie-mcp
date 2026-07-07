@@ -235,6 +235,93 @@ async () => {{
     return json.loads(value["text"])
 
 
+MIME_BY_SUFFIX = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+    ".mov": "video/quicktime",
+}
+
+
+def guess_mime(path: Path) -> str:
+    return MIME_BY_SUFFIX.get(path.suffix.lower(), "application/octet-stream")
+
+
+async def browser_upload_file(path: Path, cookies: dict[str, str], purpose: str = "attachment") -> dict[str, Any]:
+    """POST a local file as multipart/form-data to /http/upload-file-v2/direct.
+
+    Runs inside the Grok page context so cookies + statsig headers apply. Returns
+    the parsed JSON response — key field is ``fileMetadata.fileMetadataId``,
+    which becomes the ``@id`` reference for follow-up chat messages.
+    """
+    import base64
+
+    if not path.exists():
+        raise FileNotFoundError(path)
+    data = path.read_bytes()
+    if len(data) > 25 * 1024 * 1024:
+        raise ValueError(f"file too big for JS-embedded upload: {len(data)} bytes")
+    b64 = base64.b64encode(data).decode("ascii")
+    mime = guess_mime(path)
+
+    ws_url = await ensure_browser(cookies)
+    async with websockets.connect(ws_url, max_size=64 * 1024 * 1024) as ws:
+        await cdp_call(ws, 3000, "Runtime.evaluate", {"expression": STATSIG_SNIFFER_JS})
+        js = f"""
+async () => {{
+  const b64 = {js_literal(b64)};
+  const bin = atob(b64);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  const blob = new Blob([arr], {{type: {js_literal(mime)}}});
+  const fd = new FormData();
+  fd.append('file', blob, {js_literal(path.name)});
+  const headers = {{}};
+  if (window.__grokStatsigId) headers['x-statsig-id'] = window.__grokStatsigId;
+  const resp = await fetch('/http/upload-file-v2/direct', {{
+    method: 'POST',
+    credentials: 'include',
+    headers,
+    body: fd,
+  }});
+  const text = await resp.text();
+  return {{ok: resp.ok, status: resp.status, text}};
+}}
+"""
+        result = await cdp_call(ws, 3001, "Runtime.evaluate", {
+            "expression": f"({js})()",
+            "awaitPromise": True,
+            "returnByValue": True,
+        })
+    value = result.get("result", {}).get("value", {})
+    if not value.get("ok"):
+        raise RuntimeError(f"Upload failed {value.get('status')}: {value.get('text', '')[:500]}")
+    body = json.loads(value.get("text") or "{}")
+    meta = body.get("fileMetadata") or {}
+    return {
+        "file_metadata_id": meta.get("fileMetadataId"),
+        "file_uri": meta.get("fileUri"),
+        "file_name": meta.get("fileName"),
+        "mime": meta.get("fileMimeType"),
+        "assets_url": (
+            f"https://assets.grok.com/{meta['fileUri']}?cache=1"
+            if meta.get("fileUri") else None
+        ),
+        "raw": body,
+    }
+
+
+def references_prefix(reference_ids: list[str]) -> str:
+    ids = [r for r in reference_ids if r]
+    if not ids:
+        return ""
+    return "[references:" + ",".join(f"@{i}" for i in ids) + "] "
+
+
 def parse_cookie_payload(data: Any) -> dict[str, str]:
     if isinstance(data, dict):
         return {normalize_cookie_name(k): str(v) for k, v in data.items() if v}
@@ -740,7 +827,7 @@ async def search_status(cookies: dict[str, str]) -> dict[str, Any]:
     return await grok_call("/rest/media/search/status", cookies, {})
 
 
-async def start_agent_conversation(cookies: dict[str, str], project_id: str | None, first_prompt: str, extra: dict[str, Any] | None = None) -> tuple[str | None, list[dict[str, Any]]]:
+async def start_agent_conversation(cookies: dict[str, str], project_id: str | None, first_prompt: str, extra: dict[str, Any] | None = None, reference_ids: list[str] | None = None) -> tuple[str | None, list[dict[str, Any]]]:
     init_payload: dict[str, Any] = {"systemPromptName": "", "temporary": False}
     if project_id:
         init_payload["canvasId"] = project_id
@@ -748,8 +835,9 @@ async def start_agent_conversation(cookies: dict[str, str], project_id: str | No
     cid = created.get("conversationId") if isinstance(created, dict) else None
     if not cid:
         raise RuntimeError(f"Agent conversation init failed: {created}")
+    message = references_prefix(reference_ids or []) + first_prompt
     payload: dict[str, Any] = {
-        "message": first_prompt,
+        "message": message,
         "parentResponseId": "",
         "disableSearch": False,
         "enableImageGeneration": True,
@@ -770,9 +858,9 @@ async def start_agent_conversation(cookies: dict[str, str], project_id: str | No
     return cid, events
 
 
-async def send_agent_prompt(cookies: dict[str, str], conversation_id_value: str, message: str, extra: dict[str, Any] | None = None) -> Any:
+async def send_agent_prompt(cookies: dict[str, str], conversation_id_value: str, message: str, extra: dict[str, Any] | None = None, reference_ids: list[str] | None = None) -> Any:
     payload: dict[str, Any] = {
-        "message": message,
+        "message": references_prefix(reference_ids or []) + message,
         "modeId": "imagine-agent-mode-dev",
         "enableImageGeneration": True,
         "enableImageStreaming": True,
@@ -1451,6 +1539,19 @@ async def list_tools() -> list[Tool]:
             inputSchema={"type": "object", "properties": {"cookies": COOKIE_SCHEMA, "account": ACCOUNT_SCHEMA}},
         ),
         Tool(
+            name="upload_local_file",
+            description="Upload a local file to Grok storage via /http/upload-file-v2/direct. Returns fileMetadataId to use as @reference in a follow-up chat message.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute path to the local file."},
+                    "cookies": COOKIE_SCHEMA,
+                    "account": ACCOUNT_SCHEMA,
+                },
+                "required": ["path"],
+            },
+        ),
+        Tool(
             name="list_accounts",
             description="List Grok accounts available in cookies/<name>.json.",
             inputSchema={"type": "object", "properties": {}},
@@ -1788,6 +1889,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
     if name == "check_quota":
         result = await grok_request("POST", "/rest/media/imagine/quota_info", cookies, {})
+        return json_text(result)
+
+    if name == "upload_local_file":
+        p = Path(arguments["path"])
+        result = await browser_upload_file(p, cookies)
         return json_text(result)
 
     if name == "send_to_telegram":

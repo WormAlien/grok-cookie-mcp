@@ -9,4 +9,5 @@ series/
 chrome-profiles/
 .env
 *.log
+sniff-*.jsonl
 .DS_Store
