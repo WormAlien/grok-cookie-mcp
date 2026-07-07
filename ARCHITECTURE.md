@@ -48,6 +48,8 @@ Repo: https://github.com/WormAlien/grok-cookie-mcp
 ```
 app/grok-cookie-mcp/
 ├─ server.py            # MCP server (all Grok tools)
+├─ bot.py               # aiogram Telegram approval bot (imports server.py)
+├─ bot.bat              # convenience launcher for bot.py
 ├─ launcher.py          # FastAPI Chrome-with-cookies launcher UI (:8765)
 ├─ launch.bat           # convenience launcher for launcher.py
 ├─ pyproject.toml       # deps
@@ -242,11 +244,42 @@ The end goal is a "series factory":
 1. `plan_series(topic, episodes)` — Grok chat (via us) writes an episode list
    with scene descriptions + per-scene prompt + consistency notes.
 2. Each planned scene → `generate_image` preview + Telegram card with
-   inline buttons: approve / regenerate / edit.
-3. Approved scenes → `generate_video(parent_post_id, prompt)`.
+   inline buttons: approve / regenerate / edit.  ✅ implemented in `bot.py`.
+3. Approved scenes → `generate_video(parent_post_id, prompt)`.  ✅ from bot.
 4. `concat_scenes(scene_ids)` — ffmpeg stitches, adds background music,
-   optional Whisper subtitles.
+   optional Whisper subtitles.  ⏳ next.
 5. Final mp4 → Telegram + `output/series/<id>.mp4`.
+
+## Approval bot (`bot.py`)
+
+Separate aiogram process (started via `bot.bat` or `uv run python bot.py`).
+Uses the same `.env` as the MCP server, importing helpers directly from
+`server.py` (no HTTP indirection, no duplicated Grok/CDP code).
+
+Commands (owner-only, guarded by `GROK_TG_CHAT_ID`):
+- `/series <topic>` — calls `plan_series` and posts a card per scene
+- `/list` — enumerates `series/*.json`
+- `/open <id>` — picks the active series for this chat
+- `/show [id]` — re-renders scene cards for the active/named series
+- `/accounts` — lists cookie files on disk
+
+Each scene card carries inline buttons — `✅ Одобрить`, `♻️ Регенерировать`,
+`✏️ Правки` (in `planned/regenerating/video_error`), then `🎬 Сгенерировать
+видео` / `↩️ Отменить одобрение` (in `approved`), then `🔁 Перегенерировать
+видео` (in `video_ready`).
+
+Actions:
+- **approve** — marks scene `status="approved"` and rewires buttons.
+- **regenerate** — asks Grok to rewrite the single scene prompt (Agent mode
+  via `grok_chat`, UI fallback via `grok_chat_via_ui`).
+- **edit** — the next plain-text message from the owner replaces the prompt.
+- **video** — seeds a parent post (`create_and_wait_media` on the prompt),
+  runs `start_video_generation` + `wait_for_video_url`, downloads via
+  `download_asset` under account cookies, then `sendVideo` to the same chat.
+
+State: everything is persisted through `save_series(state)` — no bot-local
+storage. In-flight regen/video tasks are tracked in-memory only, to prevent
+double-clicks and let ordinary MCP tools inspect the state file at any time.
 
 ## Known limits
 

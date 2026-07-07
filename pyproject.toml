@@ -8,7 +8,9 @@ dependencies = [
     "fastapi>=0.139.0",
     "uvicorn>=0.49.0",
     "websockets>=16.0",
+    "aiogram>=3.13.0",
 ]
 
 [project.scripts]
 grok-cookie-mcp = "server:main"
+grok-approval-bot = "bot:main"
